@@ -88,6 +88,16 @@ MODULE nnp_acsf
 
    TYPE(nnp_cell_list_cache_type), SAVE, PRIVATE :: cell_list_cache
 
+   ! Persistent per-centre neighbour buffer, reused across all atoms in a force eval.
+   ! Without this each centre atom would do 9 ALLOCATEs sized in num_atoms — at ~6k atoms those
+   ! cross glibc's mmap threshold and become syscalls, giving O(N^2) malloc traffic per step.
+   ! Sized to the MAX (n_symfgrp_rad / n_symfgrp_ang) over element types so the same buffer
+   ! works for every centre regardless of which element it is.
+   TYPE(nnp_neighbor_type), SAVE, PRIVATE, TARGET :: persistent_neighbor
+   INTEGER, SAVE, PRIVATE                          :: persistent_n_capacity = -1
+   INTEGER, SAVE, PRIVATE                          :: persistent_n_rad_grp = -1
+   INTEGER, SAVE, PRIVATE                          :: persistent_n_ang_grp = -1
+
 CONTAINS
 
 ! **************************************************************************************************
@@ -115,15 +125,20 @@ CONTAINS
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: forcetmp
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: force3tmp
       REAL(KIND=dp), DIMENSION(3)                        :: rvect1, rvect2, rvect3
-      TYPE(nnp_neighbor_type)                            :: neighbor
+      TYPE(nnp_neighbor_type), POINTER                   :: neighbor
 
       CALL timeset(routineN, handle)
 
       !determine index of atom type
       ind = nnp%ele_ind(i)
 
-      ! compute neighbors of atom i
-      CALL nnp_neighbor_create(nnp, ind, nnp%num_atoms, neighbor)
+      ! Reuse the module-level persistent neighbour buffer (sized once per force eval by
+      ! nnp_neighbor_ensure_persistent).  Only the counts are reset between centre atoms;
+      ! no allocations happen in the per-atom hot path.
+      neighbor => persistent_neighbor
+      neighbor%n_rad(:) = 0
+      neighbor%n_ang1(:) = 0
+      neighbor%n_ang2(:) = 0
       CALL nnp_compute_neighbors(nnp, neighbor, i)
 
       ! Reset y:
@@ -330,7 +345,7 @@ CONTAINS
          CALL nnp_scale_acsf(nnp, ind)
       END IF
 
-      CALL nnp_neighbor_release(neighbor)
+      ! Persistent buffer — no release here; freed at program end via SAVE finalisation.
       CALL timestop(handle)
 
    END SUBROUTINE nnp_calc_acsf
@@ -1276,66 +1291,6 @@ CONTAINS
    END SUBROUTINE nnp_write_acsf
 
 ! **************************************************************************************************
-!> \brief Create neighbor object
-!> \param nnp ...
-!> \param ind ...
-!> \param nat ...
-!> \param neighbor ...
-!> \date   2020-10-10
-!> \author Christoph Schran (christoph.schran@rub.de)
-! **************************************************************************************************
-   SUBROUTINE nnp_neighbor_create(nnp, ind, nat, neighbor)
-
-      TYPE(nnp_type), INTENT(INOUT), POINTER             :: nnp
-      INTEGER, INTENT(IN)                                :: ind, nat
-      TYPE(nnp_neighbor_type), INTENT(INOUT)             :: neighbor
-
-      INTEGER                                            :: n
-      TYPE(cell_type), POINTER                           :: cell
-
-      NULLIFY (cell)
-      CALL nnp_env_get(nnp_env=nnp, cell=cell)
-
-      CALL nnp_compute_pbc_copies(neighbor%pbc_copies, cell, nnp%max_cut)
-      n = (SUM(neighbor%pbc_copies) + 1)*nat
-      ALLOCATE (neighbor%dist_rad(4, n, nnp%rad(ind)%n_symfgrp))
-      ALLOCATE (neighbor%dist_ang1(4, n, nnp%ang(ind)%n_symfgrp))
-      ALLOCATE (neighbor%dist_ang2(4, n, nnp%ang(ind)%n_symfgrp))
-      ALLOCATE (neighbor%ind_rad(n, nnp%rad(ind)%n_symfgrp))
-      ALLOCATE (neighbor%ind_ang1(n, nnp%ang(ind)%n_symfgrp))
-      ALLOCATE (neighbor%ind_ang2(n, nnp%ang(ind)%n_symfgrp))
-      ALLOCATE (neighbor%n_rad(nnp%rad(ind)%n_symfgrp))
-      ALLOCATE (neighbor%n_ang1(nnp%ang(ind)%n_symfgrp))
-      ALLOCATE (neighbor%n_ang2(nnp%ang(ind)%n_symfgrp))
-      neighbor%n_rad(:) = 0
-      neighbor%n_ang1(:) = 0
-      neighbor%n_ang2(:) = 0
-
-   END SUBROUTINE nnp_neighbor_create
-
-! **************************************************************************************************
-!> \brief Destroy neighbor object
-!> \param neighbor ...
-!> \date   2020-10-10
-!> \author Christoph Schran (christoph.schran@rub.de)
-! **************************************************************************************************
-   SUBROUTINE nnp_neighbor_release(neighbor)
-
-      TYPE(nnp_neighbor_type), INTENT(INOUT)             :: neighbor
-
-      DEALLOCATE (neighbor%dist_rad)
-      DEALLOCATE (neighbor%dist_ang1)
-      DEALLOCATE (neighbor%dist_ang2)
-      DEALLOCATE (neighbor%ind_rad)
-      DEALLOCATE (neighbor%ind_ang1)
-      DEALLOCATE (neighbor%ind_ang2)
-      DEALLOCATE (neighbor%n_rad)
-      DEALLOCATE (neighbor%n_ang1)
-      DEALLOCATE (neighbor%n_ang2)
-
-   END SUBROUTINE nnp_neighbor_release
-
-! **************************************************************************************************
 !> \brief Build neighbour list for centre atom i by walking only the 27 bins around its current bin
 !>        in the pre-expanded-image cell list.  O(k) per atom where k is the average per-bin image
 !>        occupancy — independent of total system size.  No pbc() call in the inner loop: each image
@@ -1443,6 +1398,11 @@ CONTAINS
 
       NULLIFY (cell)
       CALL nnp_env_get(nnp_env=nnp, cell=cell)
+
+      ! Ensure the persistent per-centre neighbour buffer is allocated to max capacity.
+      ! Does nothing on subsequent steps if shape is unchanged; without this each centre
+      ! atom would do 9 size-N ALLOCATEs in nnp_calc_acsf, giving O(N^2) malloc traffic.
+      CALL nnp_neighbor_ensure_persistent(nnp)
 
       ! Skin: cap at 10% of the physical cutoff so the image set stays small.
       skin = MIN(default_skin, 0.1_dp*nnp%max_cut)
@@ -1704,5 +1664,81 @@ CONTAINS
       pbc_copies(:) = pbc_copies(:)*cell%perd(:)
 
    END SUBROUTINE nnp_compute_pbc_copies
+
+! **************************************************************************************************
+!> \brief Ensure the module-level persistent neighbour buffer is allocated to the maximum capacity
+!>        needed across all element types.  After the first call (or after num_atoms / cutoff
+!>        changes) every per-centre nnp_compute_neighbors invocation just resets counts and fills
+!>        the existing buffer — no allocation traffic in the hot path.
+!>        Capacity is sized for nnp%max_cut (consistent with the original buffer shape); the
+!>        cell-list query never appends more neighbours than the per-group cutoff allows.
+!> \param nnp ...
+!> \date   2026-04-28
+!> \author Claudio Malvino
+! **************************************************************************************************
+   SUBROUTINE nnp_neighbor_ensure_persistent(nnp)
+      TYPE(nnp_type), INTENT(IN), POINTER                :: nnp
+
+      CHARACTER(len=*), PARAMETER                        :: routineN = 'nnp_neighbor_ensure_persistent'
+
+      INTEGER                                            :: handle, ie, n_ang_grp, n_capacity, &
+                                                            n_rad_grp
+      INTEGER, DIMENSION(3)                              :: pbc_copies
+      TYPE(cell_type), POINTER                           :: cell
+
+      CALL timeset(routineN, handle)
+
+      NULLIFY (cell)
+      CALL nnp_env_get(nnp_env=nnp, cell=cell)
+
+      CALL nnp_compute_pbc_copies(pbc_copies, cell, nnp%max_cut)
+      n_capacity = (SUM(pbc_copies) + 1)*nnp%num_atoms
+
+      n_rad_grp = 0
+      n_ang_grp = 0
+      DO ie = 1, nnp%n_ele
+         IF (nnp%rad(ie)%n_symfgrp > n_rad_grp) n_rad_grp = nnp%rad(ie)%n_symfgrp
+         IF (nnp%ang(ie)%n_symfgrp > n_ang_grp) n_ang_grp = nnp%ang(ie)%n_symfgrp
+      END DO
+
+      ! Cheap path: buffer already at-or-above required shape, just record current pbc_copies
+      IF (ALLOCATED(persistent_neighbor%dist_rad) .AND. &
+          persistent_n_capacity >= n_capacity .AND. &
+          persistent_n_rad_grp >= n_rad_grp .AND. &
+          persistent_n_ang_grp >= n_ang_grp) THEN
+         persistent_neighbor%pbc_copies = pbc_copies
+         CALL timestop(handle)
+         RETURN
+      END IF
+
+      ! (Re)allocate to max capacity across all element types
+      IF (ALLOCATED(persistent_neighbor%dist_rad)) DEALLOCATE (persistent_neighbor%dist_rad)
+      IF (ALLOCATED(persistent_neighbor%dist_ang1)) DEALLOCATE (persistent_neighbor%dist_ang1)
+      IF (ALLOCATED(persistent_neighbor%dist_ang2)) DEALLOCATE (persistent_neighbor%dist_ang2)
+      IF (ALLOCATED(persistent_neighbor%ind_rad)) DEALLOCATE (persistent_neighbor%ind_rad)
+      IF (ALLOCATED(persistent_neighbor%ind_ang1)) DEALLOCATE (persistent_neighbor%ind_ang1)
+      IF (ALLOCATED(persistent_neighbor%ind_ang2)) DEALLOCATE (persistent_neighbor%ind_ang2)
+      IF (ALLOCATED(persistent_neighbor%n_rad)) DEALLOCATE (persistent_neighbor%n_rad)
+      IF (ALLOCATED(persistent_neighbor%n_ang1)) DEALLOCATE (persistent_neighbor%n_ang1)
+      IF (ALLOCATED(persistent_neighbor%n_ang2)) DEALLOCATE (persistent_neighbor%n_ang2)
+
+      ALLOCATE (persistent_neighbor%dist_rad(4, n_capacity, n_rad_grp))
+      ALLOCATE (persistent_neighbor%dist_ang1(4, n_capacity, n_ang_grp))
+      ALLOCATE (persistent_neighbor%dist_ang2(4, n_capacity, n_ang_grp))
+      ALLOCATE (persistent_neighbor%ind_rad(n_capacity, n_rad_grp))
+      ALLOCATE (persistent_neighbor%ind_ang1(n_capacity, n_ang_grp))
+      ALLOCATE (persistent_neighbor%ind_ang2(n_capacity, n_ang_grp))
+      ALLOCATE (persistent_neighbor%n_rad(n_rad_grp))
+      ALLOCATE (persistent_neighbor%n_ang1(n_ang_grp))
+      ALLOCATE (persistent_neighbor%n_ang2(n_ang_grp))
+
+      persistent_neighbor%pbc_copies = pbc_copies
+      persistent_n_capacity = n_capacity
+      persistent_n_rad_grp = n_rad_grp
+      persistent_n_ang_grp = n_ang_grp
+
+      CALL timestop(handle)
+
+   END SUBROUTINE nnp_neighbor_ensure_persistent
 
 END MODULE nnp_acsf
