@@ -119,3 +119,7 @@ cd "$SCRATCH_REPO/tests"
   psmp
 
 echo "Regression tests complete."
+
+source /local/data/public/crm98/original_cp2k/tools/toolchain/install/setup
+
+echo "Shared libraries sourced from source /local/data/public/crm98/original_cp2k/tools/toolchain/install/setup"
