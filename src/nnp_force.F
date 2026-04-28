@@ -29,7 +29,8 @@ MODULE nnp_force
    USE kinds,                           ONLY: default_path_length,&
                                               default_string_length,&
                                               dp
-   USE nnp_acsf,                        ONLY: nnp_calc_acsf
+   USE nnp_acsf,                        ONLY: nnp_calc_acsf,&
+                                              nnp_prepare_cell_list_cache
    USE nnp_environment_types,           ONLY: nnp_env_get,&
                                               nnp_type
    USE nnp_model,                       ONLY: nnp_gradients,&
@@ -133,6 +134,10 @@ CONTAINS
 
       ! reset extrapolation status
       nnp%output_expol = .FALSE.
+
+      ! Prepare cell-list cache once per force eval (Verlet-skin amortised rebuild).
+      ! Subsequent nnp_compute_neighbors calls then walk only the 27 bins around each centre atom.
+      CALL nnp_prepare_cell_list_cache(nnp)
 
       ! calc atomic contribution to energy and force
       DO i = istart, istart + mecalc - 1

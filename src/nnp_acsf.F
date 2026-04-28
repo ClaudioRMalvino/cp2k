@@ -40,9 +40,53 @@ MODULE nnp_acsf
    ! Public subroutines ***
    PUBLIC :: nnp_calc_acsf, &
              nnp_init_acsf_groups, &
+             nnp_prepare_cell_list_cache, &
              nnp_sort_acsf, &
              nnp_sort_ele, &
              nnp_write_acsf
+
+! **************************************************************************************************
+!> \brief Module-level cache for the pre-expanded-image cell list used by the O(N) neighbour query.
+!>        Each (atom j, integer PBC shift (tx,ty,tz)) becomes one image entry; image positions are
+!>        stored explicitly so the inner query loop does no pbc() calls.  Grid is coarse
+!>        (bin_width ~ list_cutoff, bin_span = 1) so each centre atom walks 27 bins.  Rebuild is
+!>        triggered only by Verlet-skin violation (any atom moved > 0.5*skin) or by changes to
+!>        num_atoms / cell vectors / cutoff.
+!> \author Claudio Malvino
+!> \date   2026-04-24
+! **************************************************************************************************
+   TYPE, PRIVATE :: nnp_cell_list_cache_type
+      LOGICAL                              :: initialized   = .FALSE.
+      INTEGER                              :: num_atoms     = -1
+      INTEGER                              :: n_images      = 0
+      INTEGER                              :: n_cells       = 1
+      INTEGER, DIMENSION(3)                :: image_copies  = 0
+      INTEGER, DIMENSION(3)                :: nbin          = 1
+      INTEGER, DIMENSION(3)                :: bin_span      = 0
+      INTEGER, DIMENSION(3)                :: perd          = 0
+      LOGICAL                              :: orthorhombic  = .FALSE.
+      REAL(KIND=dp)                        :: exact_cutoff  = -1.0_dp
+      REAL(KIND=dp)                        :: list_cutoff   = -1.0_dp
+      REAL(KIND=dp)                        :: verlet_skin   = 0.0_dp
+      REAL(KIND=dp), DIMENSION(3)          :: lower         = 0.0_dp
+      REAL(KIND=dp), DIMENSION(3)          :: upper         = 0.0_dp
+      REAL(KIND=dp), DIMENSION(3)          :: bin_width     = 0.0_dp
+      REAL(KIND=dp), DIMENSION(3, 3)       :: hmat          = 0.0_dp
+      REAL(KIND=dp), DIMENSION(3, 3)       :: h_inv         = 0.0_dp
+      ! Primary (PBC-wrapped) atom positions — refreshed every prepare call
+      REAL(KIND=dp), ALLOCATABLE           :: coord_primary(:, :)         ! (3, num_atoms)
+      ! Snapshot of coord_primary at the last rebuild (Verlet reference)
+      REAL(KIND=dp), ALLOCATABLE           :: ref_coord_primary(:, :)     ! (3, num_atoms)
+      ! Image table: one entry per (atom j, integer PBC shift) pair
+      INTEGER, ALLOCATABLE                 :: image_atom(:)               ! (n_images)
+      INTEGER, ALLOCATABLE                 :: image_shift(:, :)           ! (3, n_images)
+      REAL(KIND=dp), ALLOCATABLE           :: image_translation(:, :)     ! (3, n_images)
+      ! Linked-list cell grid: head(n_cells) → first image in bin, next(n_images) chains images
+      INTEGER, ALLOCATABLE                 :: head(:)                     ! (n_cells)
+      INTEGER, ALLOCATABLE                 :: next(:)                     ! (n_images)
+   END TYPE nnp_cell_list_cache_type
+
+   TYPE(nnp_cell_list_cache_type), SAVE, PRIVATE :: cell_list_cache
 
 CONTAINS
 
@@ -1292,7 +1336,11 @@ CONTAINS
    END SUBROUTINE nnp_neighbor_release
 
 ! **************************************************************************************************
-!> \brief Generate neighboring list for an atomic configuration
+!> \brief Build neighbour list for centre atom i by walking only the 27 bins around its current bin
+!>        in the pre-expanded-image cell list.  O(k) per atom where k is the average per-bin image
+!>        occupancy — independent of total system size.  No pbc() call in the inner loop: each image
+!>        carries an explicit translation = hmat·shift, so the displacement is a direct subtraction.
+!>        cell_list_cache must be populated by nnp_prepare_cell_list_cache before any call here.
 !> \param nnp ...
 !> \param neighbor ...
 !> \param i ...
@@ -1305,61 +1353,307 @@ CONTAINS
       TYPE(nnp_neighbor_type), INTENT(INOUT)             :: neighbor
       INTEGER, INTENT(IN)                                :: i
 
-      INTEGER                                            :: c1, c2, c3, ind, j, s
-      INTEGER, DIMENSION(3)                              :: nl
+      INTEGER                                            :: bx, by, bz, cell_idx, ind, img, j, s
+      INTEGER, DIMENSION(3)                              :: bin
       REAL(KIND=dp)                                      :: norm
+      REAL(KIND=dp), DIMENSION(3)                        :: center, dr
+
+      ind = nnp%ele_ind(i)
+
+      ASSOCIATE (cl => cell_list_cache)
+         center(:) = cl%coord_primary(:, i)
+         CALL nnp_cell_list_bin_from_position(center, bin)
+
+         DO bz = MAX(1, bin(3) - cl%bin_span(3)), MIN(cl%nbin(3), bin(3) + cl%bin_span(3))
+         DO by = MAX(1, bin(2) - cl%bin_span(2)), MIN(cl%nbin(2), bin(2) + cl%bin_span(2))
+         DO bx = MAX(1, bin(1) - cl%bin_span(1)), MIN(cl%nbin(1), bin(1) + cl%bin_span(1))
+            cell_idx = nnp_cell_list_linear_index(bx, by, bz)
+            img = cl%head(cell_idx)
+            DO WHILE (img > 0)
+               j = cl%image_atom(img)
+               ! Skip self-image (j == i AND shift == 0); other periodic images of i are valid.
+               IF (j == i .AND. cl%image_shift(1, img) == 0 .AND. &
+                   cl%image_shift(2, img) == 0 .AND. cl%image_shift(3, img) == 0) THEN
+                  img = cl%next(img)
+                  CYCLE
+               END IF
+               dr(:) = center(:) - (cl%coord_primary(:, j) + cl%image_translation(:, img))
+               norm = NORM2(dr)
+               ! Identical classification block to the original double loop.
+               DO s = 1, nnp%rad(ind)%n_symfgrp
+                  IF (nnp%ele_ind(j) == nnp%rad(ind)%symfgrp(s)%ele_ind(1)) THEN
+                     IF (norm < nnp%rad(ind)%symfgrp(s)%cutoff) THEN
+                        neighbor%n_rad(s) = neighbor%n_rad(s) + 1
+                        neighbor%ind_rad(neighbor%n_rad(s), s) = j
+                        neighbor%dist_rad(1:3, neighbor%n_rad(s), s) = dr(:)
+                        neighbor%dist_rad(4, neighbor%n_rad(s), s) = norm
+                     END IF
+                  END IF
+               END DO
+               DO s = 1, nnp%ang(ind)%n_symfgrp
+                  IF (norm < nnp%ang(ind)%symfgrp(s)%cutoff) THEN
+                     IF (nnp%ele_ind(j) == nnp%ang(ind)%symfgrp(s)%ele_ind(1)) THEN
+                        neighbor%n_ang1(s) = neighbor%n_ang1(s) + 1
+                        neighbor%ind_ang1(neighbor%n_ang1(s), s) = j
+                        neighbor%dist_ang1(1:3, neighbor%n_ang1(s), s) = dr(:)
+                        neighbor%dist_ang1(4, neighbor%n_ang1(s), s) = norm
+                     END IF
+                     IF (nnp%ele_ind(j) == nnp%ang(ind)%symfgrp(s)%ele_ind(2)) THEN
+                        neighbor%n_ang2(s) = neighbor%n_ang2(s) + 1
+                        neighbor%ind_ang2(neighbor%n_ang2(s), s) = j
+                        neighbor%dist_ang2(1:3, neighbor%n_ang2(s), s) = dr(:)
+                        neighbor%dist_ang2(4, neighbor%n_ang2(s), s) = norm
+                     END IF
+                  END IF
+               END DO
+               img = cl%next(img)
+            END DO
+         END DO
+         END DO
+         END DO
+      END ASSOCIATE
+
+   END SUBROUTINE nnp_compute_neighbors
+
+! **************************************************************************************************
+!> \brief Prepare (lazily rebuild) the module-level cell-list cache for this force evaluation.
+!>        Must be called once per force eval (from nnp_calc_energy_force) before the per-atom
+!>        nnp_compute_neighbors loop.  Cheap path is O(N): refresh PBC-wrapped coords and check the
+!>        Verlet skin.  Full rebuild (O(N*(2p+1)^3)) is triggered only when an atom has moved more
+!>        than 0.5*skin or when num_atoms / cell vectors / cutoff have changed.
+!> \param nnp ...
+!> \date   2026-04-24
+!> \author Claudio Malvino
+! **************************************************************************************************
+   SUBROUTINE nnp_prepare_cell_list_cache(nnp)
+      TYPE(nnp_type), INTENT(INOUT), POINTER             :: nnp
+
+      CHARACTER(len=*), PARAMETER                        :: routineN = 'nnp_prepare_cell_list_cache'
+      REAL(KIND=dp), PARAMETER                           :: default_skin = 1.0_dp, &
+                                                            cell_tol = 1.0e-12_dp
+
+      INTEGER                                            :: handle, j
+      LOGICAL                                            :: need_rebuild
+      REAL(KIND=dp)                                      :: dispsq, half_skin_sq, list_cutoff, &
+                                                            max_disp_sq, skin
       REAL(KIND=dp), DIMENSION(3)                        :: dr
       TYPE(cell_type), POINTER                           :: cell
+
+      CALL timeset(routineN, handle)
 
       NULLIFY (cell)
       CALL nnp_env_get(nnp_env=nnp, cell=cell)
 
-      ind = nnp%ele_ind(i)
+      ! Skin: cap at 10% of the physical cutoff so the image set stays small.
+      skin = MIN(default_skin, 0.1_dp*nnp%max_cut)
+      list_cutoff = nnp%max_cut + skin
 
+      ! Allocate primary-coord buffers when num_atoms changes (or first call)
+      IF (.NOT. ALLOCATED(cell_list_cache%coord_primary) .OR. &
+          cell_list_cache%num_atoms /= nnp%num_atoms) THEN
+         IF (ALLOCATED(cell_list_cache%coord_primary)) DEALLOCATE (cell_list_cache%coord_primary)
+         IF (ALLOCATED(cell_list_cache%ref_coord_primary)) DEALLOCATE (cell_list_cache%ref_coord_primary)
+         ALLOCATE (cell_list_cache%coord_primary(3, nnp%num_atoms))
+         ALLOCATE (cell_list_cache%ref_coord_primary(3, nnp%num_atoms))
+         cell_list_cache%initialized = .FALSE.
+      END IF
+
+      ! Refresh primary atom positions every step (PBC-wrapped to the simulation cell)
       DO j = 1, nnp%num_atoms
-         DO c1 = 1, 2*neighbor%pbc_copies(1) + 1
-            nl(1) = -neighbor%pbc_copies(1) + c1 - 1
-            DO c2 = 1, 2*neighbor%pbc_copies(2) + 1
-               nl(2) = -neighbor%pbc_copies(2) + c2 - 1
-               DO c3 = 1, 2*neighbor%pbc_copies(3) + 1
-                  nl(3) = -neighbor%pbc_copies(3) + c3 - 1
-                  IF (j == i .AND. nl(1) == 0 .AND. nl(2) == 0 .AND. nl(3) == 0) CYCLE
-                  dr(:) = nnp%coord(:, i) - nnp%coord(:, j)
-                  !Apply pbc, but subtract nl boxes from periodic image
-                  dr = pbc(dr, cell, nl)
-                  norm = NORM2(dr(:))
-                  DO s = 1, nnp%rad(ind)%n_symfgrp
-                     IF (nnp%ele_ind(j) == nnp%rad(ind)%symfgrp(s)%ele_ind(1)) THEN
-                        IF (norm < nnp%rad(ind)%symfgrp(s)%cutoff) THEN
-                           neighbor%n_rad(s) = neighbor%n_rad(s) + 1
-                           neighbor%ind_rad(neighbor%n_rad(s), s) = j
-                           neighbor%dist_rad(1:3, neighbor%n_rad(s), s) = dr(:)
-                           neighbor%dist_rad(4, neighbor%n_rad(s), s) = norm
-                        END IF
-                     END IF
-                  END DO
-                  DO s = 1, nnp%ang(ind)%n_symfgrp
-                     IF (norm < nnp%ang(ind)%symfgrp(s)%cutoff) THEN
-                        IF (nnp%ele_ind(j) == nnp%ang(ind)%symfgrp(s)%ele_ind(1)) THEN
-                           neighbor%n_ang1(s) = neighbor%n_ang1(s) + 1
-                           neighbor%ind_ang1(neighbor%n_ang1(s), s) = j
-                           neighbor%dist_ang1(1:3, neighbor%n_ang1(s), s) = dr(:)
-                           neighbor%dist_ang1(4, neighbor%n_ang1(s), s) = norm
-                        END IF
-                        IF (nnp%ele_ind(j) == nnp%ang(ind)%symfgrp(s)%ele_ind(2)) THEN
-                           neighbor%n_ang2(s) = neighbor%n_ang2(s) + 1
-                           neighbor%ind_ang2(neighbor%n_ang2(s), s) = j
-                           neighbor%dist_ang2(1:3, neighbor%n_ang2(s), s) = dr(:)
-                           neighbor%dist_ang2(4, neighbor%n_ang2(s), s) = norm
-                        END IF
-                     END IF
-                  END DO
-               END DO
-            END DO
-         END DO
+         cell_list_cache%coord_primary(:, j) = pbc(nnp%coord(:, j), cell)
       END DO
 
-   END SUBROUTINE nnp_compute_neighbors
+      ! Decide whether a full rebuild is needed
+      need_rebuild = .NOT. cell_list_cache%initialized
+      IF (.NOT. need_rebuild) need_rebuild = (cell_list_cache%num_atoms /= nnp%num_atoms)
+      IF (.NOT. need_rebuild) need_rebuild = (ABS(cell_list_cache%exact_cutoff - nnp%max_cut) > cell_tol)
+      IF (.NOT. need_rebuild) need_rebuild = (ABS(cell_list_cache%verlet_skin - skin) > cell_tol)
+      IF (.NOT. need_rebuild) need_rebuild = ANY(cell_list_cache%perd /= cell%perd)
+      IF (.NOT. need_rebuild) need_rebuild = ANY(ABS(cell_list_cache%hmat - cell%hmat) > cell_tol)
+
+      IF (.NOT. need_rebuild) THEN
+         ! Verlet skin check: any atom moved more than 0.5*skin from its reference?
+         half_skin_sq = (0.5_dp*skin)**2
+         max_disp_sq = 0.0_dp
+         DO j = 1, nnp%num_atoms
+            dr(:) = cell_list_cache%coord_primary(:, j) - cell_list_cache%ref_coord_primary(:, j)
+            ! minimum image difference — handles atoms wrapping across a box face
+            dr = pbc(dr, cell)
+            dispsq = dr(1)**2 + dr(2)**2 + dr(3)**2
+            IF (dispsq > max_disp_sq) max_disp_sq = dispsq
+            IF (max_disp_sq > half_skin_sq) THEN
+               need_rebuild = .TRUE.
+               EXIT
+            END IF
+         END DO
+      END IF
+
+      IF (need_rebuild) CALL nnp_build_cell_list_cache(nnp, cell, nnp%max_cut, list_cutoff, skin)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE nnp_prepare_cell_list_cache
+
+! **************************************************************************************************
+!> \brief Rebuild the cell-list cache from scratch.  Snapshots reference coords, expands all
+!>        (atom, integer PBC shift) image entries, computes the bounding box of all image
+!>        positions (padded by half a skin), lays out a coarse grid with bin_width ≈ list_cutoff,
+!>        and links each image into its bin via head/next.
+!> \param nnp ...
+!> \param cell ...
+!> \param exact_cutoff ...
+!> \param list_cutoff ...
+!> \param skin ...
+!> \date   2026-04-24
+!> \author Claudio Malvino
+! **************************************************************************************************
+   SUBROUTINE nnp_build_cell_list_cache(nnp, cell, exact_cutoff, list_cutoff, skin)
+      TYPE(nnp_type), INTENT(IN), POINTER                :: nnp
+      TYPE(cell_type), INTENT(IN), POINTER               :: cell
+      REAL(KIND=dp), INTENT(IN)                          :: exact_cutoff, list_cutoff, skin
+
+      CHARACTER(len=*), PARAMETER                        :: routineN = 'nnp_build_cell_list_cache'
+      REAL(KIND=dp), PARAMETER                           :: rebuild_eps = 1.0e-10_dp
+
+      INTEGER                                            :: cell_idx, d, handle, img, j, &
+                                                            n_cells_total, n_img, tx, ty, tz
+      INTEGER, DIMENSION(3)                              :: bin
+      REAL(KIND=dp), DIMENSION(3)                        :: ipos
+
+      CALL timeset(routineN, handle)
+
+      ASSOCIATE (cl => cell_list_cache)
+
+         ! Snapshot rebuild-trigger state and reference coords
+         cl%num_atoms = nnp%num_atoms
+         cl%exact_cutoff = exact_cutoff
+         cl%list_cutoff = list_cutoff
+         cl%verlet_skin = skin
+         cl%perd = cell%perd
+         cl%hmat = cell%hmat
+         cl%h_inv = cell%h_inv
+         cl%orthorhombic = cell%orthorhombic
+         cl%ref_coord_primary(:, :) = cl%coord_primary(:, :)
+
+         ! Number of integer PBC shifts per dim that span list_cutoff (skin-inflated)
+         CALL nnp_compute_pbc_copies(cl%image_copies, cell, list_cutoff)
+
+         n_img = nnp%num_atoms* &
+                 (2*cl%image_copies(1) + 1)* &
+                 (2*cl%image_copies(2) + 1)* &
+                 (2*cl%image_copies(3) + 1)
+         cl%n_images = n_img
+
+         IF (ALLOCATED(cl%image_atom)) DEALLOCATE (cl%image_atom)
+         IF (ALLOCATED(cl%image_shift)) DEALLOCATE (cl%image_shift)
+         IF (ALLOCATED(cl%image_translation)) DEALLOCATE (cl%image_translation)
+         ALLOCATE (cl%image_atom(n_img))
+         ALLOCATE (cl%image_shift(3, n_img))
+         ALLOCATE (cl%image_translation(3, n_img))
+
+         ! Build image table and bounding box of all image positions
+         cl%lower(:) = HUGE(1.0_dp)
+         cl%upper(:) = -HUGE(1.0_dp)
+         img = 0
+         DO j = 1, nnp%num_atoms
+            DO tz = -cl%image_copies(3), cl%image_copies(3)
+            DO ty = -cl%image_copies(2), cl%image_copies(2)
+            DO tx = -cl%image_copies(1), cl%image_copies(1)
+               img = img + 1
+               cl%image_atom(img) = j
+               cl%image_shift(1, img) = tx
+               cl%image_shift(2, img) = ty
+               cl%image_shift(3, img) = tz
+               cl%image_translation(:, img) = cell%hmat(:, 1)*REAL(tx, dp) + &
+                                              cell%hmat(:, 2)*REAL(ty, dp) + &
+                                              cell%hmat(:, 3)*REAL(tz, dp)
+               ipos(:) = cl%coord_primary(:, j) + cl%image_translation(:, img)
+               DO d = 1, 3
+                  IF (ipos(d) < cl%lower(d)) cl%lower(d) = ipos(d)
+                  IF (ipos(d) > cl%upper(d)) cl%upper(d) = ipos(d)
+               END DO
+            END DO
+            END DO
+            END DO
+         END DO
+
+         ! Pad bounding box: half a skin on each side so atoms can drift before rebuild
+         cl%lower(:) = cl%lower(:) - (0.5_dp*skin + rebuild_eps)
+         cl%upper(:) = cl%upper(:) + (0.5_dp*skin + rebuild_eps)
+
+         ! Coarse grid: bin_width ≈ list_cutoff, so search range is 1 (27-bin walk)
+         DO d = 1, 3
+            cl%nbin(d) = MAX(1, CEILING((cl%upper(d) - cl%lower(d))/list_cutoff))
+            cl%bin_width(d) = (cl%upper(d) - cl%lower(d))/REAL(cl%nbin(d), dp)
+            IF (cl%nbin(d) == 1) THEN
+               cl%bin_span(d) = 0
+            ELSE
+               cl%bin_span(d) = MIN(cl%nbin(d) - 1, CEILING(list_cutoff/cl%bin_width(d)))
+               IF (cl%bin_span(d) < 1) cl%bin_span(d) = 1
+            END IF
+         END DO
+
+         n_cells_total = cl%nbin(1)*cl%nbin(2)*cl%nbin(3)
+         cl%n_cells = n_cells_total
+
+         IF (ALLOCATED(cl%head)) DEALLOCATE (cl%head)
+         IF (ALLOCATED(cl%next)) DEALLOCATE (cl%next)
+         ALLOCATE (cl%head(n_cells_total))
+         ALLOCATE (cl%next(n_img))
+         cl%head(:) = -1
+         cl%next(:) = -1
+
+         ! Link each image into its bin's chain (LIFO insertion at the head)
+         DO img = 1, n_img
+            j = cl%image_atom(img)
+            ipos(:) = cl%coord_primary(:, j) + cl%image_translation(:, img)
+            CALL nnp_cell_list_bin_from_position(ipos, bin)
+            cell_idx = nnp_cell_list_linear_index(bin(1), bin(2), bin(3))
+            cl%next(img) = cl%head(cell_idx)
+            cl%head(cell_idx) = img
+         END DO
+
+         cl%initialized = .TRUE.
+
+      END ASSOCIATE
+
+      CALL timestop(handle)
+
+   END SUBROUTINE nnp_build_cell_list_cache
+
+! **************************************************************************************************
+!> \brief Map a Cartesian position to its 1-based bin indices in the cell-list grid (clamped).
+!> \param pos ...
+!> \param bin ...
+! **************************************************************************************************
+   SUBROUTINE nnp_cell_list_bin_from_position(pos, bin)
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN)            :: pos
+      INTEGER, DIMENSION(3), INTENT(OUT)                 :: bin
+
+      INTEGER                                            :: d
+
+      DO d = 1, 3
+         bin(d) = INT((pos(d) - cell_list_cache%lower(d))/cell_list_cache%bin_width(d)) + 1
+         IF (bin(d) < 1) bin(d) = 1
+         IF (bin(d) > cell_list_cache%nbin(d)) bin(d) = cell_list_cache%nbin(d)
+      END DO
+
+   END SUBROUTINE nnp_cell_list_bin_from_position
+
+! **************************************************************************************************
+!> \brief Linearise 1-based 3D bin coordinates into the head() index.
+!> \param bx ...
+!> \param by ...
+!> \param bz ...
+!> \return ...
+! **************************************************************************************************
+   PURE FUNCTION nnp_cell_list_linear_index(bx, by, bz) RESULT(idx)
+      INTEGER, INTENT(IN)                                :: bx, by, bz
+      INTEGER                                            :: idx
+
+      idx = bx + cell_list_cache%nbin(1)*((by - 1) + cell_list_cache%nbin(2)*(bz - 1))
+
+   END FUNCTION nnp_cell_list_linear_index
 
 ! **************************************************************************************************
 !> \brief Determine required pbc copies for small cells
