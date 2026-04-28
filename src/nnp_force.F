@@ -65,9 +65,10 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER :: routineN = 'nnp_calc_energy_force'
 
-      INTEGER                                            :: handle, i, i_com, ig, ind, istart, j, k, &
-                                                            m, mecalc
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: allcalc
+      INTEGER                                            :: handle, i, i_com, idx, ie, ig, ind, &
+                                                            istart, j, k, m, max_nsym, mecalc, &
+                                                            n_active
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: active_atoms, active_flag, allcalc
       LOGICAL                                            :: calc_stress
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: denergydsym
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: dsymdxyz, stress
@@ -139,6 +140,27 @@ CONTAINS
       ! Subsequent nnp_compute_neighbors calls then walk only the 27 bins around each centre atom.
       CALL nnp_prepare_cell_list_cache(nnp)
 
+      ! Hoist scratch allocations out of the per-centre loop:
+      !   * dsymdxyz is sized to MAX(n_nodes(1)) over element types so the same buffer serves
+      !     every centre regardless of element. Its O(num_atoms) third dimension is touched only
+      !     for atoms in the active list — we zero those entries selectively after use.
+      !   * active_atoms / active_flag track the centre + every neighbour the cell-list walk
+      !     touched, so the per-centre force-accumulation walks ~k atoms instead of all N.
+      IF (calc_forces) THEN
+         max_nsym = 0
+         DO ie = 1, nnp%n_ele
+            IF (nnp%arc(ie)%n_nodes(1) > max_nsym) max_nsym = nnp%arc(ie)%n_nodes(1)
+         END DO
+         ALLOCATE (dsymdxyz(3, max_nsym, nnp%num_atoms))
+         dsymdxyz(:, :, :) = 0.0_dp
+         ALLOCATE (active_atoms(nnp%num_atoms))
+         ALLOCATE (active_flag(nnp%num_atoms))
+         active_flag(:) = 0
+         IF (calc_stress) THEN
+            ALLOCATE (stress(3, 3, max_nsym))
+         END IF
+      END IF
+
       ! calc atomic contribution to energy and force
       DO i = istart, istart + mecalc - 1
 
@@ -152,14 +174,15 @@ CONTAINS
          IF (calc_forces) THEN
             !reset input grads of ele(ind):
             nnp%arc(ind)%layer(1)%node_grad(:) = 0.0_dp
-            ALLOCATE (dsymdxyz(3, nnp%arc(ind)%n_nodes(1), nnp%num_atoms))
-            dsymdxyz(:, :, :) = 0.0_dp
             IF (calc_stress) THEN
-               ALLOCATE (stress(3, 3, nnp%arc(ind)%n_nodes(1)))
-               stress(:, :, :) = 0.0_dp
-               CALL nnp_calc_acsf(nnp, i, dsymdxyz, stress)
+               stress(:, :, 1:nnp%arc(ind)%n_nodes(1)) = 0.0_dp
+               CALL nnp_calc_acsf(nnp, i, dsymdxyz, stress, &
+                                  active_atoms=active_atoms, active_flag=active_flag, &
+                                  n_active=n_active)
             ELSE
-               CALL nnp_calc_acsf(nnp, i, dsymdxyz)
+               CALL nnp_calc_acsf(nnp, i, dsymdxyz, &
+                                  active_atoms=active_atoms, active_flag=active_flag, &
+                                  n_active=n_active)
             END IF
          ELSE
             CALL nnp_calc_acsf(nnp, i)
@@ -171,13 +194,15 @@ CONTAINS
             nnp%atomic_energy(i, i_com) = nnp%arc(ind)%layer(nnp%n_layer)%node(1) + &
                                           nnp%atom_energies(ind)
 
-            ! predict forces
+            ! predict forces — restrict the accumulation to atoms touched by this centre's
+            ! neighbour walk (active_atoms).  Drops O(num_atoms) inner loop to O(n_active).
             IF (calc_forces) THEN
                ALLOCATE (denergydsym(nnp%arc(ind)%n_nodes(1)))
                denergydsym(:) = 0.0_dp
                CALL nnp_gradients(nnp%arc(ind), nnp, i_com, denergydsym)
                DO j = 1, nnp%arc(ind)%n_nodes(1)
-                  DO k = 1, nnp%num_atoms
+                  DO idx = 1, n_active
+                     k = active_atoms(idx)
                      DO m = 1, 3
                         nnp%myforce(m, k, i_com) = nnp%myforce(m, k, i_com) - denergydsym(j)*dsymdxyz(m, j, k)
                      END DO
@@ -191,15 +216,27 @@ CONTAINS
             END IF
          END DO
 
-         !deallocate memory
+         ! Selectively zero the dsymdxyz slice we just used and clear active_flag, so the
+         ! buffer is clean for the next centre atom.  Cost is O(n_active) per centre.
          IF (calc_forces) THEN
-            DEALLOCATE (dsymdxyz)
-            IF (calc_stress) THEN
-               DEALLOCATE (stress)
-            END IF
+            DO idx = 1, n_active
+               k = active_atoms(idx)
+               dsymdxyz(:, 1:nnp%arc(ind)%n_nodes(1), k) = 0.0_dp
+               active_flag(k) = 0
+            END DO
          END IF
 
       END DO ! loop over num_atoms
+
+      ! Free hoisted scratch buffers
+      IF (calc_forces) THEN
+         DEALLOCATE (dsymdxyz)
+         DEALLOCATE (active_atoms)
+         DEALLOCATE (active_flag)
+         IF (calc_stress) THEN
+            DEALLOCATE (stress)
+         END IF
+      END IF
 
       ! calculate energy:
       CALL logger%para_env%sum(nnp%atomic_energy(:, :))

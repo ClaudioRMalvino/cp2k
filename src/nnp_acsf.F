@@ -109,12 +109,14 @@ CONTAINS
 !> \date   2020-10-10
 !> \author Christoph Schran (christoph.schran@rub.de)
 ! **************************************************************************************************
-   SUBROUTINE nnp_calc_acsf(nnp, i, dsymdxyz, stress)
+   SUBROUTINE nnp_calc_acsf(nnp, i, dsymdxyz, stress, active_atoms, active_flag, n_active)
 
       TYPE(nnp_type), INTENT(INOUT), POINTER             :: nnp
       INTEGER, INTENT(IN)                                :: i
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(INOUT), &
          OPTIONAL                                        :: dsymdxyz, stress
+      INTEGER, DIMENSION(:), OPTIONAL, INTENT(INOUT)     :: active_atoms, active_flag
+      INTEGER, OPTIONAL, INTENT(OUT)                     :: n_active
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'nnp_calc_acsf'
 
@@ -140,6 +142,44 @@ CONTAINS
       neighbor%n_ang1(:) = 0
       neighbor%n_ang2(:) = 0
       CALL nnp_compute_neighbors(nnp, neighbor, i)
+
+      ! Build active-atoms list: centre i + every distinct neighbour touched by the rad/ang
+      ! lists.  active_flag is the dedup map (caller resets touched entries to 0 between centres).
+      ! Restricts the O(num_atoms) dsymdxyz / force-accumulation loops to the actual neighbour
+      ! set — drops O(N^2) per force eval to O(N) at fixed density.
+      IF (PRESENT(active_atoms) .AND. PRESENT(active_flag) .AND. PRESENT(n_active)) THEN
+         n_active = 1
+         active_atoms(1) = i
+         active_flag(i) = 1
+         DO s = 1, nnp%rad(ind)%n_symfgrp
+            DO j = 1, neighbor%n_rad(s)
+               jj = neighbor%ind_rad(j, s)
+               IF (active_flag(jj) == 0) THEN
+                  n_active = n_active + 1
+                  active_atoms(n_active) = jj
+                  active_flag(jj) = 1
+               END IF
+            END DO
+         END DO
+         DO s = 1, nnp%ang(ind)%n_symfgrp
+            DO j = 1, neighbor%n_ang1(s)
+               jj = neighbor%ind_ang1(j, s)
+               IF (active_flag(jj) == 0) THEN
+                  n_active = n_active + 1
+                  active_atoms(n_active) = jj
+                  active_flag(jj) = 1
+               END IF
+            END DO
+            DO j = 1, neighbor%n_ang2(s)
+               jj = neighbor%ind_ang2(j, s)
+               IF (active_flag(jj) == 0) THEN
+                  n_active = n_active + 1
+                  active_atoms(n_active) = jj
+                  active_flag(jj) = 1
+               END IF
+            END DO
+         END DO
+      END IF
 
       ! Reset y:
       nnp%rad(ind)%y = 0.0_dp
@@ -337,9 +377,17 @@ CONTAINS
 
       IF (PRESENT(dsymdxyz)) THEN
          IF (PRESENT(stress)) THEN
-            CALL nnp_scale_acsf(nnp, ind, dsymdxyz, stress)
+            IF (PRESENT(active_atoms) .AND. PRESENT(n_active)) THEN
+               CALL nnp_scale_acsf(nnp, ind, dsymdxyz, stress, active_atoms, n_active)
+            ELSE
+               CALL nnp_scale_acsf(nnp, ind, dsymdxyz, stress)
+            END IF
          ELSE
-            CALL nnp_scale_acsf(nnp, ind, dsymdxyz)
+            IF (PRESENT(active_atoms) .AND. PRESENT(n_active)) THEN
+               CALL nnp_scale_acsf(nnp, ind, dsymdxyz, active_atoms=active_atoms, n_active=n_active)
+            ELSE
+               CALL nnp_scale_acsf(nnp, ind, dsymdxyz)
+            END IF
          END IF
       ELSE
          CALL nnp_scale_acsf(nnp, ind)
@@ -401,14 +449,16 @@ CONTAINS
 !> \date   2020-10-10
 !> \author Christoph Schran (christoph.schran@rub.de)
 ! **************************************************************************************************
-   SUBROUTINE nnp_scale_acsf(nnp, ind, dsymdxyz, stress)
+   SUBROUTINE nnp_scale_acsf(nnp, ind, dsymdxyz, stress, active_atoms, n_active)
 
       TYPE(nnp_type), INTENT(INOUT)                      :: nnp
       INTEGER, INTENT(IN)                                :: ind
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(OUT), &
          OPTIONAL                                        :: dsymdxyz, stress
+      INTEGER, DIMENSION(:), OPTIONAL, INTENT(IN)        :: active_atoms
+      INTEGER, OPTIONAL, INTENT(IN)                      :: n_active
 
-      INTEGER                                            :: j, k, off
+      INTEGER                                            :: idx, j, k, off
 
       IF (nnp%center_acsf) THEN
          DO j = 1, nnp%n_rad(ind)
@@ -474,41 +524,85 @@ CONTAINS
          END DO
       END IF
 
+      ! dsymdxyz scaling: walk only the active atoms when the caller provided them
+      ! (drops O(num_atoms) per centre to O(n_active) ≈ O(1) at fixed density).
       IF (PRESENT(dsymdxyz)) THEN
          IF (nnp%scale_acsf) THEN
-            DO k = 1, nnp%num_atoms
-               DO j = 1, nnp%n_rad(ind)
-                  dsymdxyz(:, j, k) = dsymdxyz(:, j, k)/ &
-                                      (nnp%rad(ind)%loc_max(j) - &
-                                       nnp%rad(ind)%loc_min(j))* &
-                                      (nnp%scmax - nnp%scmin)
+            IF (PRESENT(active_atoms) .AND. PRESENT(n_active)) THEN
+               DO idx = 1, n_active
+                  k = active_atoms(idx)
+                  DO j = 1, nnp%n_rad(ind)
+                     dsymdxyz(:, j, k) = dsymdxyz(:, j, k)/ &
+                                         (nnp%rad(ind)%loc_max(j) - &
+                                          nnp%rad(ind)%loc_min(j))* &
+                                         (nnp%scmax - nnp%scmin)
+                  END DO
                END DO
-            END DO
-            off = nnp%n_rad(ind)
-            DO k = 1, nnp%num_atoms
-               DO j = 1, nnp%n_ang(ind)
-                  dsymdxyz(:, j + off, k) = dsymdxyz(:, j + off, k)/ &
-                                            (nnp%ang(ind)%loc_max(j) - &
-                                             nnp%ang(ind)%loc_min(j))* &
-                                            (nnp%scmax - nnp%scmin)
+               off = nnp%n_rad(ind)
+               DO idx = 1, n_active
+                  k = active_atoms(idx)
+                  DO j = 1, nnp%n_ang(ind)
+                     dsymdxyz(:, j + off, k) = dsymdxyz(:, j + off, k)/ &
+                                               (nnp%ang(ind)%loc_max(j) - &
+                                                nnp%ang(ind)%loc_min(j))* &
+                                               (nnp%scmax - nnp%scmin)
+                  END DO
                END DO
-            END DO
+            ELSE
+               DO k = 1, nnp%num_atoms
+                  DO j = 1, nnp%n_rad(ind)
+                     dsymdxyz(:, j, k) = dsymdxyz(:, j, k)/ &
+                                         (nnp%rad(ind)%loc_max(j) - &
+                                          nnp%rad(ind)%loc_min(j))* &
+                                         (nnp%scmax - nnp%scmin)
+                  END DO
+               END DO
+               off = nnp%n_rad(ind)
+               DO k = 1, nnp%num_atoms
+                  DO j = 1, nnp%n_ang(ind)
+                     dsymdxyz(:, j + off, k) = dsymdxyz(:, j + off, k)/ &
+                                               (nnp%ang(ind)%loc_max(j) - &
+                                                nnp%ang(ind)%loc_min(j))* &
+                                               (nnp%scmax - nnp%scmin)
+                  END DO
+               END DO
+            END IF
          ELSE IF (nnp%scale_sigma_acsf) THEN
-            DO k = 1, nnp%num_atoms
-               DO j = 1, nnp%n_rad(ind)
-                  dsymdxyz(:, j, k) = dsymdxyz(:, j, k)/ &
-                                      nnp%rad(ind)%sigma(j)* &
-                                      (nnp%scmax - nnp%scmin)
+            IF (PRESENT(active_atoms) .AND. PRESENT(n_active)) THEN
+               DO idx = 1, n_active
+                  k = active_atoms(idx)
+                  DO j = 1, nnp%n_rad(ind)
+                     dsymdxyz(:, j, k) = dsymdxyz(:, j, k)/ &
+                                         nnp%rad(ind)%sigma(j)* &
+                                         (nnp%scmax - nnp%scmin)
+                  END DO
                END DO
-            END DO
-            off = nnp%n_rad(ind)
-            DO k = 1, nnp%num_atoms
-               DO j = 1, nnp%n_ang(ind)
-                  dsymdxyz(:, j + off, k) = dsymdxyz(:, j + off, k)/ &
-                                            nnp%ang(ind)%sigma(j)* &
-                                            (nnp%scmax - nnp%scmin)
+               off = nnp%n_rad(ind)
+               DO idx = 1, n_active
+                  k = active_atoms(idx)
+                  DO j = 1, nnp%n_ang(ind)
+                     dsymdxyz(:, j + off, k) = dsymdxyz(:, j + off, k)/ &
+                                               nnp%ang(ind)%sigma(j)* &
+                                               (nnp%scmax - nnp%scmin)
+                  END DO
                END DO
-            END DO
+            ELSE
+               DO k = 1, nnp%num_atoms
+                  DO j = 1, nnp%n_rad(ind)
+                     dsymdxyz(:, j, k) = dsymdxyz(:, j, k)/ &
+                                         nnp%rad(ind)%sigma(j)* &
+                                         (nnp%scmax - nnp%scmin)
+                  END DO
+               END DO
+               off = nnp%n_rad(ind)
+               DO k = 1, nnp%num_atoms
+                  DO j = 1, nnp%n_ang(ind)
+                     dsymdxyz(:, j + off, k) = dsymdxyz(:, j + off, k)/ &
+                                               nnp%ang(ind)%sigma(j)* &
+                                               (nnp%scmax - nnp%scmin)
+                  END DO
+               END DO
+            END IF
          END IF
       END IF
 
@@ -1308,16 +1402,21 @@ CONTAINS
       TYPE(nnp_neighbor_type), INTENT(INOUT)             :: neighbor
       INTEGER, INTENT(IN)                                :: i
 
-      INTEGER                                            :: bx, by, bz, cell_idx, ind, img, j, s
+      INTEGER                                            :: bx, by, bz, cell_idx, ind, img, j, &
+                                                            j_type, n_count, s
       INTEGER, DIMENSION(3)                              :: bin
-      REAL(KIND=dp)                                      :: norm
-      REAL(KIND=dp), DIMENSION(3)                        :: center, dr
+      REAL(KIND=dp)                                      :: cx, cy, cz, drx, dry, drz, max_cut_sq, &
+                                                            norm, r2
 
       ind = nnp%ele_ind(i)
+      max_cut_sq = nnp%max_cut*nnp%max_cut
 
       ASSOCIATE (cl => cell_list_cache)
-         center(:) = cl%coord_primary(:, i)
-         CALL nnp_cell_list_bin_from_position(center, bin)
+         ! Hoist centre coordinates as scalars (no array temporaries inside the bin walk)
+         cx = cl%coord_primary(1, i)
+         cy = cl%coord_primary(2, i)
+         cz = cl%coord_primary(3, i)
+         CALL nnp_cell_list_bin_from_position([cx, cy, cz], bin)
 
          DO bz = MAX(1, bin(3) - cl%bin_span(3)), MIN(cl%nbin(3), bin(3) + cl%bin_span(3))
          DO by = MAX(1, bin(2) - cl%bin_span(2)), MIN(cl%nbin(2), bin(2) + cl%bin_span(2))
@@ -1332,32 +1431,52 @@ CONTAINS
                   img = cl%next(img)
                   CYCLE
                END IF
-               dr(:) = center(:) - (cl%coord_primary(:, j) + cl%image_translation(:, img))
-               norm = NORM2(dr)
-               ! Identical classification block to the original double loop.
+               ! Manual scalar dr (avoid Fortran array temporaries)
+               drx = cx - (cl%coord_primary(1, j) + cl%image_translation(1, img))
+               dry = cy - (cl%coord_primary(2, j) + cl%image_translation(2, img))
+               drz = cz - (cl%coord_primary(3, j) + cl%image_translation(3, img))
+               r2 = drx*drx + dry*dry + drz*drz
+               ! Cheap reject before SQRT: anything past max_cut can't enter any group's list.
+               IF (r2 >= max_cut_sq) THEN
+                  img = cl%next(img)
+                  CYCLE
+               END IF
+               norm = SQRT(r2)
+               ! Hoist neighbour element type once (saves repeated indirect loads in the cmp).
+               j_type = nnp%ele_ind(j)
+               ! Identical classification logic to the original double loop, scalar fill.
                DO s = 1, nnp%rad(ind)%n_symfgrp
-                  IF (nnp%ele_ind(j) == nnp%rad(ind)%symfgrp(s)%ele_ind(1)) THEN
+                  IF (j_type == nnp%rad(ind)%symfgrp(s)%ele_ind(1)) THEN
                      IF (norm < nnp%rad(ind)%symfgrp(s)%cutoff) THEN
-                        neighbor%n_rad(s) = neighbor%n_rad(s) + 1
-                        neighbor%ind_rad(neighbor%n_rad(s), s) = j
-                        neighbor%dist_rad(1:3, neighbor%n_rad(s), s) = dr(:)
-                        neighbor%dist_rad(4, neighbor%n_rad(s), s) = norm
+                        n_count = neighbor%n_rad(s) + 1
+                        neighbor%n_rad(s) = n_count
+                        neighbor%ind_rad(n_count, s) = j
+                        neighbor%dist_rad(1, n_count, s) = drx
+                        neighbor%dist_rad(2, n_count, s) = dry
+                        neighbor%dist_rad(3, n_count, s) = drz
+                        neighbor%dist_rad(4, n_count, s) = norm
                      END IF
                   END IF
                END DO
                DO s = 1, nnp%ang(ind)%n_symfgrp
                   IF (norm < nnp%ang(ind)%symfgrp(s)%cutoff) THEN
-                     IF (nnp%ele_ind(j) == nnp%ang(ind)%symfgrp(s)%ele_ind(1)) THEN
-                        neighbor%n_ang1(s) = neighbor%n_ang1(s) + 1
-                        neighbor%ind_ang1(neighbor%n_ang1(s), s) = j
-                        neighbor%dist_ang1(1:3, neighbor%n_ang1(s), s) = dr(:)
-                        neighbor%dist_ang1(4, neighbor%n_ang1(s), s) = norm
+                     IF (j_type == nnp%ang(ind)%symfgrp(s)%ele_ind(1)) THEN
+                        n_count = neighbor%n_ang1(s) + 1
+                        neighbor%n_ang1(s) = n_count
+                        neighbor%ind_ang1(n_count, s) = j
+                        neighbor%dist_ang1(1, n_count, s) = drx
+                        neighbor%dist_ang1(2, n_count, s) = dry
+                        neighbor%dist_ang1(3, n_count, s) = drz
+                        neighbor%dist_ang1(4, n_count, s) = norm
                      END IF
-                     IF (nnp%ele_ind(j) == nnp%ang(ind)%symfgrp(s)%ele_ind(2)) THEN
-                        neighbor%n_ang2(s) = neighbor%n_ang2(s) + 1
-                        neighbor%ind_ang2(neighbor%n_ang2(s), s) = j
-                        neighbor%dist_ang2(1:3, neighbor%n_ang2(s), s) = dr(:)
-                        neighbor%dist_ang2(4, neighbor%n_ang2(s), s) = norm
+                     IF (j_type == nnp%ang(ind)%symfgrp(s)%ele_ind(2)) THEN
+                        n_count = neighbor%n_ang2(s) + 1
+                        neighbor%n_ang2(s) = n_count
+                        neighbor%ind_ang2(n_count, s) = j
+                        neighbor%dist_ang2(1, n_count, s) = drx
+                        neighbor%dist_ang2(2, n_count, s) = dry
+                        neighbor%dist_ang2(3, n_count, s) = drz
+                        neighbor%dist_ang2(4, n_count, s) = norm
                      END IF
                   END IF
                END DO
