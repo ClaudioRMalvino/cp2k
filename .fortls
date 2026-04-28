@@ -1,0 +1,6 @@
+{
+    "nthreads": 1,
+    "excl_paths": [
+        "src/commutator_rpnl.F"
+    ]
+}
