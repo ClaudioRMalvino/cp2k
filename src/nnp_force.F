@@ -67,8 +67,8 @@ CONTAINS
 
       INTEGER                                            :: handle, i, i_com, idx, ie, ig, ind, &
                                                             istart, j, k, m, max_nsym, mecalc, &
-                                                            n_active
-      INTEGER, ALLOCATABLE, DIMENSION(:), SAVE                 :: active_atoms, active_flag, allcalc
+                                                            n_active, n_base, n_remainder
+      INTEGER, ALLOCATABLE, DIMENSION(:), SAVE                 :: active_atoms, active_flag
       LOGICAL                                            :: calc_stress
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:), SAVE           :: denergydsym
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), SAVE    :: dsymdxyz, stress
@@ -121,18 +121,19 @@ CONTAINS
          END DO
       END DO
 
-      ! parallization:
-      mecalc = nnp%num_atoms/logger%para_env%num_pe + &
-               MIN(MOD(nnp%num_atoms, logger%para_env%num_pe)/ &
-                   (logger%para_env%mepos + 1), 1)
-      ALLOCATE (allcalc(logger%para_env%num_pe))
-      allcalc(:) = 0
-      CALL logger%para_env%allgather(mecalc, allcalc)
-      istart = 1
-      DO i = 2, logger%para_env%mepos + 1
-         istart = istart + allcalc(i - 1)
-      END DO
-
+      ! Parallelisation: compute each rank's atom slice analytically.
+      ! mecalc(p) = base+1 for p < remainder, base otherwise.  istart is the prefix sum.
+      ! No allgather needed — the formula is deterministic given num_atoms, num_pe, mepos.
+      n_base = nnp%num_atoms/logger%para_env%num_pe
+      n_remainder = MOD(nnp%num_atoms, logger%para_env%num_pe)
+      IF (logger%para_env%mepos < n_remainder) THEN
+         mecalc = n_base + 1
+         istart = 1 + logger%para_env%mepos*(n_base + 1)
+      ELSE
+         mecalc = n_base
+         istart = 1 + n_remainder*(n_base + 1) + (logger%para_env%mepos - n_remainder)*n_base
+      END IF
+      
       ! reset extrapolation status
       nnp%output_expol = .FALSE.
 
@@ -153,17 +154,17 @@ CONTAINS
          END DO
          ! Only allocate if it hasn't been allocated yet, or if the system grew
          IF (.NOT. ALLOCATED(dsymdxyz) .OR. SIZE(dsymdxyz, 3) /= nnp%num_atoms) THEN
-            IF (ALLOCATED(dsymdxyz)) DEALLOCATE (dsymdxyz, active_atoms, active_flag, denergydsym)
-            ALLOCATE (dsymdxyz(3, max_nsym, nnp%num_atoms))
+            IF (ALLOCATED(dsymdxyz)) THEN
+               DEALLOCATE (dsymdxyz, active_atoms, active_flag, denergydsym)
+               IF (ALLOCATED(stress)) DEALLOCATE (stress)
+            END IF
+            ALLOCATE (dsymdxyz(3, max_nsym, nnp%num_atoms), SOURCE=0.0_dp)
             ALLOCATE (active_atoms(nnp%num_atoms))
-            ALLOCATE (active_flag(nnp%num_atoms))
+            ALLOCATE (active_flag(nnp%num_atoms), SOURCE=0)
             ALLOCATE (denergydsym(max_nsym))
-            IF (calc_stress) ALLOCATE (stress(3, 3, max_nsym))
          END IF
+         IF (calc_stress .AND. .NOT. ALLOCATED(stress)) ALLOCATE (stress(3, 3, max_nsym))
       END IF
-
-      dsymdxyz(:, :, :) = 0.0_dp
-      active_flag(:) = 0
 
       ! calc atomic contribution to energy and force
       DO i = istart, istart + mecalc - 1
@@ -203,17 +204,19 @@ CONTAINS
             IF (calc_forces) THEN
                denergydsym(1:nnp%arc(ind)%n_nodes(1)) = 0.0_dp
                CALL nnp_gradients(nnp%arc(ind), nnp, i_com, denergydsym)
-               DO j = 1, nnp%arc(ind)%n_nodes(1)
-                  DO idx = 1, n_active
-                     k = active_atoms(idx)
+               IF (calc_stress) THEN
+                  DO j = 1, nnp%arc(ind)%n_nodes(1)
+                     nnp%committee_stress(:, :, i_com) = nnp%committee_stress(:, :, i_com) - &
+                                                         denergydsym(j)*stress(:, :, j)
+                  END DO
+               END IF
+               DO idx = 1, n_active
+                  k = active_atoms(idx)
+                  DO j = 1, nnp%arc(ind)%n_nodes(1)
                      DO m = 1, 3
                         nnp%myforce(m, k, i_com) = nnp%myforce(m, k, i_com) - denergydsym(j)*dsymdxyz(m, j, k)
                      END DO
                   END DO
-                  IF (calc_stress) THEN
-                     nnp%committee_stress(:, :, i_com) = nnp%committee_stress(:, :, i_com) - &
-                                                         denergydsym(j)*stress(:, :, j)
-                  END IF
                END DO
             END IF
          END DO
@@ -272,8 +275,6 @@ CONTAINS
       ! print properties if requested
       print_section => section_vals_get_subs_vals(nnp%nnp_input, "PRINT")
       CALL nnp_print(nnp, print_section)
-
-      DEALLOCATE (allcalc)
 
       CALL timestop(handle)
 

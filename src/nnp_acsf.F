@@ -321,14 +321,12 @@ CONTAINS
                      r3 = NORM2(rvect3(:))
                      IF (r3 < nnp%ang(ind)%symfgrp(s)%cutoff) THEN
                         jj = neighbor%ind_ang1(j, s)
-                        kk = neighbor%ind_ang1(k, s)
+                        kk = neighbor%ind_ang2(k, s)
                         CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, &
                                           r1, r2, r3, symtmp, force3tmp)
                         !loop over associated sym fncts
                         DO sf = 1, nnp%ang(ind)%symfgrp(s)%n_symf
                            m = off + nnp%ang(ind)%symfgrp(s)%symf(sf)
-                           jj = neighbor%ind_ang1(j, s)
-                           kk = neighbor%ind_ang2(k, s)
                            ! update forces into dsymdxy
                            DO l = 1, 3
                               dsymdxyz(l, m, i) = dsymdxyz(l, m, i) &
@@ -1530,7 +1528,6 @@ CONTAINS
                DO j = 1, nnp%rad(i)%n_symfgrp
                   DO k = 1, SIZE(nnp%rad(i)%symfgrp(j)%ele_ind)
                      IF (nnp%rad(i)%symfgrp(j)%ele_ind(k) > 0) THEN
-                        INTEGER :: col, pos
                         col = nnp%rad(i)%symfgrp(j)%ele_ind(k)
                         pos = nnp%rad(i)%ele_grp_count(col) + 1
                         nnp%rad(i)%ele_grp_list(pos, col) = j
@@ -1553,7 +1550,6 @@ CONTAINS
                DO j = 1, nnp%ang(i)%n_symfgrp
                   DO k = 1, SIZE(nnp%ang(i)%symfgrp(j)%ele_ind)
                      IF (nnp%ang(i)%symfgrp(j)%ele_ind(k) > 0) THEN
-                        INTEGER :: col, pos
                         col = nnp%ang(i)%symfgrp(j)%ele_ind(k)
                         ! If this group lists ele_ind(1) or ele_ind(2) depends on construction
                         ! add group j to both ele1 and ele2 lists if matching
@@ -1751,11 +1747,9 @@ CONTAINS
                j_type = nnp%ele_ind(j)
                ! lazy sqrt: compute norm only if at least one group accepts this image
                norm = -1.0_dp
-               ! Radial groups: use per-element group mapping to iterate only relevant groups
-               IF (ALLOCATED(nnp%rad(ind)%ele_grp_count)) THEN
-                  n_count = 0
-                  DO k = 1, nnp%rad(ind)%ele_grp_count(j_type)
-                     s = nnp%rad(ind)%ele_grp_list(k, j_type)
+               ! Identical classification logic to the original double loop, scalar fill.
+               DO s = 1, nnp%rad(ind)%n_symfgrp
+                  IF (j_type == nnp%rad(ind)%symfgrp(s)%ele_ind(1)) THEN
                      IF (r2 < nnp%rad(ind)%symfgrp(s)%cutoff_sq) THEN
                         IF (norm < 0.0_dp) norm = SQRT(r2)
                         n_count = neighbor%n_rad(s) + 1
@@ -1766,13 +1760,11 @@ CONTAINS
                         neighbor%dist_rad(3, n_count, s) = drz
                         neighbor%dist_rad(4, n_count, s) = norm
                      END IF
-                  END DO
-               END IF
-               ! Angular groups: check ele1 and ele2 mappings
-               IF (ALLOCATED(nnp%ang(ind)%ele1_grp_count)) THEN
-                  DO k = 1, nnp%ang(ind)%ele1_grp_count(j_type)
-                     s = nnp%ang(ind)%ele1_grp_list(k, j_type)
-                     IF (r2 < nnp%ang(ind)%symfgrp(s)%cutoff_sq) THEN
+                  END IF
+               END DO
+               DO s = 1, nnp%ang(ind)%n_symfgrp
+                  IF (r2 < nnp%ang(ind)%symfgrp(s)%cutoff_sq) THEN
+                     IF (j_type == nnp%ang(ind)%symfgrp(s)%ele_ind(1)) THEN
                         IF (norm < 0.0_dp) norm = SQRT(r2)
                         n_count = neighbor%n_ang1(s) + 1
                         neighbor%n_ang1(s) = n_count
@@ -1782,12 +1774,7 @@ CONTAINS
                         neighbor%dist_ang1(3, n_count, s) = drz
                         neighbor%dist_ang1(4, n_count, s) = norm
                      END IF
-                  END DO
-               END IF
-               IF (ALLOCATED(nnp%ang(ind)%ele2_grp_count)) THEN
-                  DO k = 1, nnp%ang(ind)%ele2_grp_count(j_type)
-                     s = nnp%ang(ind)%ele2_grp_list(k, j_type)
-                     IF (r2 < nnp%ang(ind)%symfgrp(s)%cutoff_sq) THEN
+                     IF (j_type == nnp%ang(ind)%symfgrp(s)%ele_ind(2)) THEN
                         IF (norm < 0.0_dp) norm = SQRT(r2)
                         n_count = neighbor%n_ang2(s) + 1
                         neighbor%n_ang2(s) = n_count
@@ -1797,8 +1784,8 @@ CONTAINS
                         neighbor%dist_ang2(3, n_count, s) = drz
                         neighbor%dist_ang2(4, n_count, s) = norm
                      END IF
-                  END DO
-               END IF
+                  END IF
+               END DO
                img = cl%next(img)
             END DO
          END DO
@@ -1871,12 +1858,13 @@ CONTAINS
 
       IF (.NOT. need_rebuild) THEN
          ! Verlet skin check: any atom moved more than 0.5*skin from its reference?
+         ! coord_primary is already PBC-wrapped; atoms that cross a box face appear to jump
+         ! by ~box_size, triggering a conservative rebuild — that is correct and harmless.
+         ! No minimum-image correction needed: the rebuild cost is negligible vs a pbc() per atom.
          half_skin_sq = (0.5_dp*skin)**2
          max_disp_sq = 0.0_dp
          DO j = 1, nnp%num_atoms
             dr(:) = cell_list_cache%coord_primary(:, j) - cell_list_cache%ref_coord_primary(:, j)
-            ! minimum image difference — handles atoms wrapping across a box face
-            dr = pbc(dr, cell)
             dispsq = dr(1)**2 + dr(2)**2 + dr(3)**2
             IF (dispsq > max_disp_sq) max_disp_sq = dispsq
             IF (max_disp_sq > half_skin_sq) THEN

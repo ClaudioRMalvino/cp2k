@@ -7,8 +7,11 @@
 /lib/
 /obj/
 /regtesting/
-logs/
-slurm_scripts/
+
+# AI-generated files
+*.claude
+*.copilot
+*.gpt
 
 # ignore former git submodules
 /tools/prettify/fprettify
@@ -351,7 +354,7 @@ cython_debug/
 
 ### VS Code ####
 /.vscode
-.claude
+
 ### Vim ###
 # Swap
 [._]*.s[a-v][a-z]
