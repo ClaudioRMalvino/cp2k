@@ -741,7 +741,7 @@ CONTAINS
       funccut = nnp%rad(ind)%symfgrp(s)%cutoff !cutoff
       SELECT CASE (nnp%cut_type)
       CASE (nnp_cut_cos)
-         tmp = pi*r/funccut
+         tmp = r * nnp%rad(ind)%symfgrp(s)%pi_over_cut
          
          idx = INT((tmp - spline_cache%min_cos) * spline_cache%inv_dx_cos) + 1
          IF (idx < 1) idx = 1
@@ -760,7 +760,7 @@ CONTAINS
          END IF
 
       CASE (nnp_cut_tanh)
-         tmp = 1.0_dp - r/funccut
+         tmp = 1.0_dp - r * nnp%rad(ind)%symfgrp(s)%inv_cut
          
          idx = INT((tmp - spline_cache%min_tanh) * spline_cache%inv_dx_tanh) + 1
          IF (idx < 1) idx = 1
@@ -887,7 +887,7 @@ CONTAINS
       fcut = nnp%ang(ind)%symfgrp(s)%cutoff !cutoff
       SELECT CASE (nnp%cut_type)
       CASE (nnp_cut_cos)
-         tmp1 = pi*r1/fcut
+         tmp1 = r1 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
          idx = INT((tmp1 - spline_cache%min_cos) * spline_cache%inv_dx_cos) + 1
          IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
          t = tmp1 - (spline_cache%min_cos + REAL(idx - 1, dp) * spline_cache%dx_cos)
@@ -896,7 +896,7 @@ CONTAINS
          IF (PRESENT(force)) dcos_dx1 = spline_cache%coef_cos(2, idx) + & 
          t * (2.0_dp * spline_cache%coef_cos(3, idx) + t * 3.0_dp * spline_cache%coef_cos(4, idx))
 
-         tmp2 = pi*r2/fcut
+         tmp2 = r2 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
          idx = INT((tmp2 - spline_cache%min_cos) * spline_cache%inv_dx_cos) + 1
          IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
          t = tmp2 - (spline_cache%min_cos + REAL(idx - 1, dp) * spline_cache%dx_cos)
@@ -905,7 +905,7 @@ CONTAINS
          IF (PRESENT(force)) dcos_dx2 = spline_cache%coef_cos(2, idx) + &
                t * (2.0_dp * spline_cache%coef_cos(3, idx) + t * 3.0_dp * spline_cache%coef_cos(4, idx))
 
-         tmp3 = pi*r3/fcut
+         tmp3 = r3 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
          idx = INT((tmp3 - spline_cache%min_cos) * spline_cache%inv_dx_cos) + 1
          IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
          t = tmp3 - (spline_cache%min_cos + REAL(idx - 1, dp) * spline_cache%dx_cos)
@@ -923,7 +923,7 @@ CONTAINS
          END IF
 
       CASE (nnp_cut_tanh)
-         tmp1 = 1.0_dp - r1/fcut
+         tmp1 = 1.0_dp - r1 * nnp%ang(ind)%symfgrp(s)%inv_cut
          idx = INT((tmp1 - spline_cache%min_tanh) * spline_cache%inv_dx_tanh) + 1
          IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
          t = tmp1 - (spline_cache%min_tanh + REAL(idx - 1, dp) * spline_cache%dx_tanh)
@@ -931,7 +931,7 @@ CONTAINS
                      t * (spline_cache%coef_tanh(3, idx) + t * spline_cache%coef_tanh(4, idx)))
          fcut1 = tanh_val1**3
 
-         tmp2 = 1.0_dp - r2/fcut
+         tmp2 = 1.0_dp - r2 * nnp%ang(ind)%symfgrp(s)%inv_cut
          idx = INT((tmp2 - spline_cache%min_tanh) * spline_cache%inv_dx_tanh) + 1
          IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
          t = tmp2 - (spline_cache%min_tanh + REAL(idx - 1, dp) * spline_cache%dx_tanh)
@@ -939,7 +939,7 @@ CONTAINS
                      t * (spline_cache%coef_tanh(3, idx) + t * spline_cache%coef_tanh(4, idx)))
          fcut2 = tanh_val2**3
 
-         tmp3 = 1.0_dp - r3/fcut
+         tmp3 = 1.0_dp - r3 * nnp%ang(ind)%symfgrp(s)%inv_cut
          idx = INT((tmp3 - spline_cache%min_tanh) * spline_cache%inv_dx_tanh) + 1
          IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
          t = tmp3 - (spline_cache%min_tanh + REAL(idx - 1, dp) * spline_cache%dx_tanh)
@@ -1375,6 +1375,7 @@ CONTAINS
       TYPE(nnp_type), INTENT(INOUT)                      :: nnp
 
       INTEGER                                            :: ang, i, j, k, rad, s, zint
+      INTEGER                                            :: col, pos
       REAL(KIND=dp)                                      :: funccut
 
       ! Variables for inline Spline Initialization
@@ -1449,6 +1450,9 @@ CONTAINS
                      rad = rad + 1
                      funccut = nnp%rad(i)%funccut(s)
                      nnp%rad(i)%symfgrp(rad)%cutoff = funccut
+                     nnp%rad(i)%symfgrp(rad)%cutoff_sq = funccut*funccut
+                     nnp%rad(i)%symfgrp(rad)%inv_cut = 1.0_dp/funccut
+                     nnp%rad(i)%symfgrp(rad)%pi_over_cut = pi/funccut
                      ALLOCATE (nnp%rad(i)%symfgrp(rad)%ele(1))
                      ALLOCATE (nnp%rad(i)%symfgrp(rad)%ele_ind(1))
                      nnp%rad(i)%symfgrp(rad)%ele(1) = nnp%ele(j)
@@ -1470,6 +1474,9 @@ CONTAINS
                         ang = ang + 1
                         funccut = nnp%ang(i)%funccut(s)
                         nnp%ang(i)%symfgrp(ang)%cutoff = funccut
+                        nnp%ang(i)%symfgrp(ang)%cutoff_sq = funccut*funccut
+                        nnp%ang(i)%symfgrp(ang)%inv_cut = 1.0_dp/funccut
+                        nnp%ang(i)%symfgrp(ang)%pi_over_cut = pi/funccut
                         ALLOCATE (nnp%ang(i)%symfgrp(ang)%ele(2))
                         ALLOCATE (nnp%ang(i)%symfgrp(ang)%ele_ind(2))
                         nnp%ang(i)%symfgrp(ang)%ele(1) = nnp%ele(j)
@@ -1513,6 +1520,57 @@ CONTAINS
                END IF
             END DO
          END DO
+
+            ! Build element->group mapping for radial groups: ele_grp_count and ele_grp_list
+            IF (nnp%rad(i)%n_symfgrp > 0) THEN
+               ALLOCATE(nnp%rad(i)%ele_grp_count(nnp%n_ele))
+               ALLOCATE(nnp%rad(i)%ele_grp_list(nnp%rad(i)%n_symfgrp, nnp%n_ele))
+               nnp%rad(i)%ele_grp_count(:) = 0
+               nnp%rad(i)%ele_grp_list(:,:) = 0
+               DO j = 1, nnp%rad(i)%n_symfgrp
+                  DO k = 1, SIZE(nnp%rad(i)%symfgrp(j)%ele_ind)
+                     IF (nnp%rad(i)%symfgrp(j)%ele_ind(k) > 0) THEN
+                        INTEGER :: col, pos
+                        col = nnp%rad(i)%symfgrp(j)%ele_ind(k)
+                        pos = nnp%rad(i)%ele_grp_count(col) + 1
+                        nnp%rad(i)%ele_grp_list(pos, col) = j
+                        nnp%rad(i)%ele_grp_count(col) = pos
+                     END IF
+                  END DO
+               END DO
+            END IF
+
+            ! Build element->group mappings for angular groups: ele1 and ele2
+            IF (nnp%ang(i)%n_symfgrp > 0) THEN
+               ALLOCATE(nnp%ang(i)%ele1_grp_count(nnp%n_ele))
+               ALLOCATE(nnp%ang(i)%ele1_grp_list(nnp%ang(i)%n_symfgrp, nnp%n_ele))
+               ALLOCATE(nnp%ang(i)%ele2_grp_count(nnp%n_ele))
+               ALLOCATE(nnp%ang(i)%ele2_grp_list(nnp%ang(i)%n_symfgrp, nnp%n_ele))
+               nnp%ang(i)%ele1_grp_count(:) = 0
+               nnp%ang(i)%ele2_grp_count(:) = 0
+               nnp%ang(i)%ele1_grp_list(:,:) = 0
+               nnp%ang(i)%ele2_grp_list(:,:) = 0
+               DO j = 1, nnp%ang(i)%n_symfgrp
+                  DO k = 1, SIZE(nnp%ang(i)%symfgrp(j)%ele_ind)
+                     IF (nnp%ang(i)%symfgrp(j)%ele_ind(k) > 0) THEN
+                        INTEGER :: col, pos
+                        col = nnp%ang(i)%symfgrp(j)%ele_ind(k)
+                        ! If this group lists ele_ind(1) or ele_ind(2) depends on construction
+                        ! add group j to both ele1 and ele2 lists if matching
+                        IF (nnp%ang(i)%symfgrp(j)%ele_ind(1) == col) THEN
+                           pos = nnp%ang(i)%ele1_grp_count(col) + 1
+                           nnp%ang(i)%ele1_grp_list(pos, col) = j
+                           nnp%ang(i)%ele1_grp_count(col) = pos
+                        END IF
+                        IF (nnp%ang(i)%symfgrp(j)%ele_ind(2) == col) THEN
+                           pos = nnp%ang(i)%ele2_grp_count(col) + 1
+                           nnp%ang(i)%ele2_grp_list(pos, col) = j
+                           nnp%ang(i)%ele2_grp_count(col) = pos
+                        END IF
+                     END IF
+                  END DO
+               END DO
+            END IF
       END DO
 
       ! -------------------------------------------------------------------------
@@ -1651,7 +1709,7 @@ CONTAINS
       INTEGER, INTENT(IN)                                :: i
 
       INTEGER                                            :: bx, by, bz, cell_idx, ind, img, j, &
-                                                            j_type, n_count, s
+                                 j_type, n_count, s, k
       INTEGER, DIMENSION(3)                              :: bin
       REAL(KIND=dp)                                      :: cx, cy, cz, drx, dry, drz, max_cut_sq, &
                                                             norm, r2
@@ -1689,13 +1747,17 @@ CONTAINS
                   img = cl%next(img)
                   CYCLE
                END IF
-               norm = SQRT(r2)
                ! Hoist neighbour element type once (saves repeated indirect loads in the cmp).
                j_type = nnp%ele_ind(j)
-               ! Identical classification logic to the original double loop, scalar fill.
-               DO s = 1, nnp%rad(ind)%n_symfgrp
-                  IF (j_type == nnp%rad(ind)%symfgrp(s)%ele_ind(1)) THEN
-                     IF (norm < nnp%rad(ind)%symfgrp(s)%cutoff) THEN
+               ! lazy sqrt: compute norm only if at least one group accepts this image
+               norm = -1.0_dp
+               ! Radial groups: use per-element group mapping to iterate only relevant groups
+               IF (ALLOCATED(nnp%rad(ind)%ele_grp_count)) THEN
+                  n_count = 0
+                  DO k = 1, nnp%rad(ind)%ele_grp_count(j_type)
+                     s = nnp%rad(ind)%ele_grp_list(k, j_type)
+                     IF (r2 < nnp%rad(ind)%symfgrp(s)%cutoff_sq) THEN
+                        IF (norm < 0.0_dp) norm = SQRT(r2)
                         n_count = neighbor%n_rad(s) + 1
                         neighbor%n_rad(s) = n_count
                         neighbor%ind_rad(n_count, s) = j
@@ -1704,11 +1766,14 @@ CONTAINS
                         neighbor%dist_rad(3, n_count, s) = drz
                         neighbor%dist_rad(4, n_count, s) = norm
                      END IF
-                  END IF
-               END DO
-               DO s = 1, nnp%ang(ind)%n_symfgrp
-                  IF (norm < nnp%ang(ind)%symfgrp(s)%cutoff) THEN
-                     IF (j_type == nnp%ang(ind)%symfgrp(s)%ele_ind(1)) THEN
+                  END DO
+               END IF
+               ! Angular groups: check ele1 and ele2 mappings
+               IF (ALLOCATED(nnp%ang(ind)%ele1_grp_count)) THEN
+                  DO k = 1, nnp%ang(ind)%ele1_grp_count(j_type)
+                     s = nnp%ang(ind)%ele1_grp_list(k, j_type)
+                     IF (r2 < nnp%ang(ind)%symfgrp(s)%cutoff_sq) THEN
+                        IF (norm < 0.0_dp) norm = SQRT(r2)
                         n_count = neighbor%n_ang1(s) + 1
                         neighbor%n_ang1(s) = n_count
                         neighbor%ind_ang1(n_count, s) = j
@@ -1717,7 +1782,13 @@ CONTAINS
                         neighbor%dist_ang1(3, n_count, s) = drz
                         neighbor%dist_ang1(4, n_count, s) = norm
                      END IF
-                     IF (j_type == nnp%ang(ind)%symfgrp(s)%ele_ind(2)) THEN
+                  END DO
+               END IF
+               IF (ALLOCATED(nnp%ang(ind)%ele2_grp_count)) THEN
+                  DO k = 1, nnp%ang(ind)%ele2_grp_count(j_type)
+                     s = nnp%ang(ind)%ele2_grp_list(k, j_type)
+                     IF (r2 < nnp%ang(ind)%symfgrp(s)%cutoff_sq) THEN
+                        IF (norm < 0.0_dp) norm = SQRT(r2)
                         n_count = neighbor%n_ang2(s) + 1
                         neighbor%n_ang2(s) = n_count
                         neighbor%ind_ang2(n_count, s) = j
@@ -1726,8 +1797,8 @@ CONTAINS
                         neighbor%dist_ang2(3, n_count, s) = drz
                         neighbor%dist_ang2(4, n_count, s) = norm
                      END IF
-                  END IF
-               END DO
+                  END DO
+               END IF
                img = cl%next(img)
             END DO
          END DO

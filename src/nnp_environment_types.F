@@ -153,6 +153,9 @@ MODULE nnp_environment_types
       INTEGER, DIMENSION(:), ALLOCATABLE                  :: ele_ind
       CHARACTER(LEN=2), DIMENSION(:), ALLOCATABLE         :: ele
       REAL(KIND=dp)                                       :: cutoff = -1.0_dp
+      REAL(KIND=dp)                                       :: cutoff_sq = -1.0_dp
+      REAL(KIND=dp)                                       :: inv_cut = -1.0_dp
+      REAL(KIND=dp)                                       :: pi_over_cut = -1.0_dp
    END TYPE nnp_symfgrp_type
 
 ! **************************************************************************************************
@@ -183,6 +186,9 @@ MODULE nnp_environment_types
       INTEGER, ALLOCATABLE, DIMENSION(:)                  :: nuc_ele
       INTEGER                                             :: n_symfgrp = -1
       TYPE(nnp_symfgrp_type), DIMENSION(:), ALLOCATABLE   :: symfgrp
+      ! Per-centre map from neighbour element index -> list of radial groups
+      INTEGER, ALLOCATABLE, DIMENSION(:)                  :: ele_grp_count
+      INTEGER, ALLOCATABLE, DIMENSION(:, : )              :: ele_grp_list
    END TYPE nnp_acsf_rad_type
 
 ! **************************************************************************************************
@@ -225,6 +231,11 @@ MODULE nnp_environment_types
       INTEGER, ALLOCATABLE, DIMENSION(:)                  :: nuc_ele2
       INTEGER                                             :: n_symfgrp = -1
       TYPE(nnp_symfgrp_type), DIMENSION(:), ALLOCATABLE   :: symfgrp
+      ! Per-centre maps from neighbour element index -> list of angular groups
+      INTEGER, ALLOCATABLE, DIMENSION(:)                  :: ele1_grp_count
+      INTEGER, ALLOCATABLE, DIMENSION(:, : )              :: ele1_grp_list
+      INTEGER, ALLOCATABLE, DIMENSION(:)                  :: ele2_grp_count
+      INTEGER, ALLOCATABLE, DIMENSION(:, : )              :: ele2_grp_list
    END TYPE nnp_acsf_ang_type
 
 ! **************************************************************************************************
@@ -301,6 +312,8 @@ CONTAINS
                         nnp_env%rad(i)%sigma, &
                         nnp_env%rad(i)%ele, &
                         nnp_env%rad(i)%nuc_ele, &
+                        nnp_env%rad(i)%ele_grp_count, &
+                        nnp_env%rad(i)%ele_grp_list, &
                         nnp_env%rad(i)%symfgrp)
          END DO
          DEALLOCATE (nnp_env%rad)
@@ -329,6 +342,10 @@ CONTAINS
                         nnp_env%ang(i)%ele2, &
                         nnp_env%ang(i)%nuc_ele1, &
                         nnp_env%ang(i)%nuc_ele2, &
+                        nnp_env%ang(i)%ele1_grp_count, &
+                        nnp_env%ang(i)%ele1_grp_list, &
+                        nnp_env%ang(i)%ele2_grp_count, &
+                        nnp_env%ang(i)%ele2_grp_list, &
                         nnp_env%ang(i)%symfgrp)
          END DO
          DEALLOCATE (nnp_env%ang)
