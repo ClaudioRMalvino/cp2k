@@ -115,6 +115,11 @@ MODULE nnp_acsf
    INTEGER, SAVE, PRIVATE                          :: persistent_n_capacity = -1
    INTEGER, SAVE, PRIVATE                          :: persistent_n_rad_grp = -1
    INTEGER, SAVE, PRIVATE                          :: persistent_n_ang_grp = -1
+   ! Module-level scratch buffers to avoid repeated allocate/deallocate in hot loops
+   INTEGER, SAVE, PRIVATE                          :: scratch_max_sym = -1
+   REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_sym(:)
+   REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_forcetmp(:,:)
+   REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_force3tmp(:,:,:)
 
 CONTAINS
 
@@ -141,9 +146,9 @@ CONTAINS
       INTEGER                                            :: handle, handle_sf, ind, j, jj, k, kk, l, &
                                                             m, off, s, sf
       REAL(KIND=dp)                                      :: r1, r2, r3
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: symtmp
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: forcetmp
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: force3tmp
+      REAL(KIND=dp), DIMENSION(:), POINTER               :: symtmp
+      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: forcetmp
+      REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: force3tmp
       REAL(KIND=dp), DIMENSION(3)                        :: rvect1, rvect2, rvect3
       TYPE(nnp_neighbor_type), POINTER                   :: neighbor
 
@@ -208,8 +213,22 @@ CONTAINS
          !loop over radial sym fnct grps
          CALL timeset('nnp_acsf_radial', handle_sf)
          DO s = 1, nnp%rad(ind)%n_symfgrp
-            ALLOCATE (symtmp(nnp%rad(ind)%symfgrp(s)%n_symf))
-            ALLOCATE (forcetmp(3, nnp%rad(ind)%symfgrp(s)%n_symf))
+            ! reuse module-level scratch buffers to avoid repeated alloc/dealloc
+            IF (.NOT. ALLOCATED(scratch_sym)) THEN
+               ALLOCATE(scratch_sym(nnp%rad(ind)%symfgrp(s)%n_symf))
+               ALLOCATE(scratch_forcetmp(3, nnp%rad(ind)%symfgrp(s)%n_symf))
+               ALLOCATE(scratch_force3tmp(3,3,nnp%rad(ind)%symfgrp(s)%n_symf))
+               scratch_max_sym = SIZE(scratch_sym)
+            ELSE IF (scratch_max_sym < nnp%rad(ind)%symfgrp(s)%n_symf) THEN
+               ! grow to fit if necessary
+               DEALLOCATE(scratch_sym); DEALLOCATE(scratch_forcetmp); DEALLOCATE(scratch_force3tmp)
+               ALLOCATE(scratch_sym(nnp%rad(ind)%symfgrp(s)%n_symf))
+               ALLOCATE(scratch_forcetmp(3, nnp%rad(ind)%symfgrp(s)%n_symf))
+               ALLOCATE(scratch_force3tmp(3,3,nnp%rad(ind)%symfgrp(s)%n_symf))
+               scratch_max_sym = SIZE(scratch_sym)
+            END IF
+            symtmp => scratch_sym(1:nnp%rad(ind)%symfgrp(s)%n_symf)
+            forcetmp => scratch_forcetmp(:, 1:nnp%rad(ind)%symfgrp(s)%n_symf)
             !loop over associated neighbors
             DO j = 1, neighbor%n_rad(s)
                rvect1 = neighbor%dist_rad(1:3, j, s)
@@ -231,16 +250,29 @@ CONTAINS
                   nnp%rad(ind)%y(m) = nnp%rad(ind)%y(m) + symtmp(sf)
                END DO
             END DO
-            DEALLOCATE (symtmp)
-            DEALLOCATE (forcetmp)
+            NULLIFY(symtmp)
+            NULLIFY(forcetmp)
          END DO
          CALL timestop(handle_sf)
          !loop over angular sym fnct grps
          CALL timeset('nnp_acsf_angular', handle_sf)
          off = nnp%n_rad(ind)
          DO s = 1, nnp%ang(ind)%n_symfgrp
-            ALLOCATE (symtmp(nnp%ang(ind)%symfgrp(s)%n_symf))
-            ALLOCATE (force3tmp(3, 3, nnp%ang(ind)%symfgrp(s)%n_symf))
+            ! reuse module-level scratch buffers to avoid repeated alloc/dealloc
+            IF (.NOT. ALLOCATED(scratch_sym)) THEN
+               ALLOCATE(scratch_sym(nnp%ang(ind)%symfgrp(s)%n_symf))
+               ALLOCATE(scratch_forcetmp(3, nnp%ang(ind)%symfgrp(s)%n_symf))
+               ALLOCATE(scratch_force3tmp(3,3,nnp%ang(ind)%symfgrp(s)%n_symf))
+               scratch_max_sym = SIZE(scratch_sym)
+            ELSE IF (scratch_max_sym < nnp%ang(ind)%symfgrp(s)%n_symf) THEN
+               DEALLOCATE(scratch_sym); DEALLOCATE(scratch_forcetmp); DEALLOCATE(scratch_force3tmp)
+               ALLOCATE(scratch_sym(nnp%ang(ind)%symfgrp(s)%n_symf))
+               ALLOCATE(scratch_forcetmp(3, nnp%ang(ind)%symfgrp(s)%n_symf))
+               ALLOCATE(scratch_force3tmp(3,3,nnp%ang(ind)%symfgrp(s)%n_symf))
+               scratch_max_sym = SIZE(scratch_sym)
+            END IF
+            symtmp => scratch_sym(1:nnp%ang(ind)%symfgrp(s)%n_symf)
+            force3tmp => scratch_force3tmp(:,:, 1:nnp%ang(ind)%symfgrp(s)%n_symf)
             !loop over associated neighbors
             IF (nnp%ang(ind)%symfgrp(s)%ele(1) == nnp%ang(ind)%symfgrp(s)%ele(2)) THEN
                DO j = 1, neighbor%n_ang1(s)
@@ -318,8 +350,8 @@ CONTAINS
                   END DO
                END DO
             END IF
-            DEALLOCATE (symtmp)
-            DEALLOCATE (force3tmp)
+            NULLIFY(symtmp)
+            NULLIFY(force3tmp)
          END DO
          CALL timestop(handle_sf)
          !no forces
@@ -327,7 +359,15 @@ CONTAINS
          !loop over radial sym fnct grps
          CALL timeset('nnp_acsf_radial', handle_sf)
          DO s = 1, nnp%rad(ind)%n_symfgrp
-            ALLOCATE (symtmp(nnp%rad(ind)%symfgrp(s)%n_symf))
+            IF (.NOT. ALLOCATED(scratch_sym)) THEN
+               ALLOCATE(scratch_sym(nnp%rad(ind)%symfgrp(s)%n_symf))
+               scratch_max_sym = SIZE(scratch_sym)
+            ELSE IF (scratch_max_sym < nnp%rad(ind)%symfgrp(s)%n_symf) THEN
+               DEALLOCATE(scratch_sym)
+               ALLOCATE(scratch_sym(nnp%rad(ind)%symfgrp(s)%n_symf))
+               scratch_max_sym = SIZE(scratch_sym)
+            END IF
+            symtmp => scratch_sym(1:nnp%rad(ind)%symfgrp(s)%n_symf)
             !loop over associated neighbors
             DO j = 1, neighbor%n_rad(s)
                rvect1 = neighbor%dist_rad(1:3, j, s)
@@ -338,14 +378,22 @@ CONTAINS
                   nnp%rad(ind)%y(m) = nnp%rad(ind)%y(m) + symtmp(sf)
                END DO
             END DO
-            DEALLOCATE (symtmp)
+            NULLIFY(symtmp)
          END DO
          CALL timestop(handle_sf)
          !loop over angular sym fnct grps
          CALL timeset('nnp_acsf_angular', handle_sf)
          off = nnp%n_rad(ind)
          DO s = 1, nnp%ang(ind)%n_symfgrp
-            ALLOCATE (symtmp(nnp%ang(ind)%symfgrp(s)%n_symf))
+            IF (.NOT. ALLOCATED(scratch_sym)) THEN
+               ALLOCATE(scratch_sym(nnp%ang(ind)%symfgrp(s)%n_symf))
+               scratch_max_sym = SIZE(scratch_sym)
+            ELSE IF (scratch_max_sym < nnp%ang(ind)%symfgrp(s)%n_symf) THEN
+               DEALLOCATE(scratch_sym)
+               ALLOCATE(scratch_sym(nnp%ang(ind)%symfgrp(s)%n_symf))
+               scratch_max_sym = SIZE(scratch_sym)
+            END IF
+            symtmp => scratch_sym(1:nnp%ang(ind)%symfgrp(s)%n_symf)
             !loop over associated neighbors
             IF (nnp%ang(ind)%symfgrp(s)%ele(1) == nnp%ang(ind)%symfgrp(s)%ele(2)) THEN
                DO j = 1, neighbor%n_ang1(s)
@@ -385,7 +433,7 @@ CONTAINS
                   END DO
                END DO
             END IF
-            DEALLOCATE (symtmp)
+            NULLIFY(symtmp)
          END DO
          CALL timestop(handle_sf)
       END IF
@@ -2001,7 +2049,7 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'nnp_neighbor_ensure_persistent'
 
       INTEGER                                            :: handle, ie, n_ang_grp, n_capacity, &
-                                                            n_rad_grp
+                                 n_rad_grp, max_sym, s
       INTEGER, DIMENSION(3)                              :: pbc_copies
       TYPE(cell_type), POINTER                           :: cell
 
@@ -2011,7 +2059,8 @@ CONTAINS
       CALL nnp_env_get(nnp_env=nnp, cell=cell)
 
       CALL nnp_compute_pbc_copies(pbc_copies, cell, nnp%max_cut)
-      n_capacity = (SUM(pbc_copies) + 1)*nnp%num_atoms
+      ! Correct capacity: product of copies per-dim (2*copies+1) times num_atoms
+      n_capacity = nnp%num_atoms * (2*pbc_copies(1) + 1) * (2*pbc_copies(2) + 1) * (2*pbc_copies(3) + 1)
 
       n_rad_grp = 0
       n_ang_grp = 0
@@ -2019,6 +2068,28 @@ CONTAINS
          IF (nnp%rad(ie)%n_symfgrp > n_rad_grp) n_rad_grp = nnp%rad(ie)%n_symfgrp
          IF (nnp%ang(ie)%n_symfgrp > n_ang_grp) n_ang_grp = nnp%ang(ie)%n_symfgrp
       END DO
+
+      ! Ensure module-level scratch temporaries are allocated to handle the largest group
+      ! Determine maximum symf size across all groups
+      max_sym = 0
+      DO ie = 1, nnp%n_ele
+         DO s = 1, nnp%rad(ie)%n_symfgrp
+            IF (nnp%rad(ie)%symfgrp(s)%n_symf > max_sym) max_sym = nnp%rad(ie)%symfgrp(s)%n_symf
+         END DO
+         DO s = 1, nnp%ang(ie)%n_symfgrp
+            IF (nnp%ang(ie)%symfgrp(s)%n_symf > max_sym) max_sym = nnp%ang(ie)%symfgrp(s)%n_symf
+         END DO
+      END DO
+      IF (max_sym < 1) max_sym = 1
+      IF (.NOT. ALLOCATED(scratch_sym) .OR. scratch_max_sym < max_sym) THEN
+         IF (ALLOCATED(scratch_sym)) DEALLOCATE(scratch_sym)
+         IF (ALLOCATED(scratch_forcetmp)) DEALLOCATE(scratch_forcetmp)
+         IF (ALLOCATED(scratch_force3tmp)) DEALLOCATE(scratch_force3tmp)
+         ALLOCATE(scratch_sym(max_sym))
+         ALLOCATE(scratch_forcetmp(3, max_sym))
+         ALLOCATE(scratch_force3tmp(3,3,max_sym))
+         scratch_max_sym = max_sym
+      END IF
 
       ! Cheap path: buffer already at-or-above required shape, just record current pbc_copies
       IF (ALLOCATED(persistent_neighbor%dist_rad) .AND. &

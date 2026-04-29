@@ -1,10 +1,10 @@
  # Version information for this restart file 
- # current date 2026-04-29 19:42:20.108
+ # current date 2026-04-29 21:42:09.938
  # current working dir /lsc/zeushome/crm98/cp2k/benchmarks/NNP
- # Program compiled at                                       2026-04-29 19:17:47
- # Program compiled on                                             phy-cerberus4
+ # Program compiled at                                       2026-04-23 16:49:23
+ # Program compiled on                                                 cerberus1
  # Program compiled for                                                   x86_64
- # Source code revision number                                        151b7d1223
+ # Source code revision number                                        d5b0302fb9
  &GLOBAL
    PRINT_LEVEL LOW
    PROJECT_NAME "H2O-64_NNP_MD"
@@ -35,7 +35,7 @@
      &AVERAGES T
        &RESTART_AVERAGES
          ITIMES_START 1
-         AVECPU  9.2247737012803574E-002
+         AVECPU  1.2909055233001704E-001
          AVEHUGONIOT  0.0000000000000000E+000
          AVETEMP_BARO  0.0000000000000000E+000
          AVEPOT  3.7512320941400212E+003
