@@ -68,10 +68,10 @@ CONTAINS
       INTEGER                                            :: handle, i, i_com, idx, ie, ig, ind, &
                                                             istart, j, k, m, max_nsym, mecalc, &
                                                             n_active
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: active_atoms, active_flag, allcalc
+      INTEGER, ALLOCATABLE, DIMENSION(:), SAVE                 :: active_atoms, active_flag, allcalc
       LOGICAL                                            :: calc_stress
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: denergydsym
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)     :: dsymdxyz, stress
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:), SAVE           :: denergydsym
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), SAVE    :: dsymdxyz, stress
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(cp_subsys_type), POINTER                      :: subsys
@@ -151,17 +151,19 @@ CONTAINS
          DO ie = 1, nnp%n_ele
             IF (nnp%arc(ie)%n_nodes(1) > max_nsym) max_nsym = nnp%arc(ie)%n_nodes(1)
          END DO
-         ALLOCATE (dsymdxyz(3, max_nsym, nnp%num_atoms))
-         dsymdxyz(:, :, :) = 0.0_dp
-         ALLOCATE (active_atoms(nnp%num_atoms))
-         ALLOCATE (active_flag(nnp%num_atoms))
-         active_flag(:) = 0
-         ! Hoisted: avoid 6k * n_committee tiny ALLOCATE/DEALLOCATEs per step
-         ALLOCATE (denergydsym(max_nsym))
-         IF (calc_stress) THEN
-            ALLOCATE (stress(3, 3, max_nsym))
+         ! Only allocate if it hasn't been allocated yet, or if the system grew
+         IF (.NOT. ALLOCATED(dsymdxyz) .OR. SIZE(dsymdxyz, 3) /= nnp%num_atoms) THEN
+            IF (ALLOCATED(dsymdxyz)) DEALLOCATE (dsymdxyz, active_atoms, active_flag, denergydsym)
+            ALLOCATE (dsymdxyz(3, max_nsym, nnp%num_atoms))
+            ALLOCATE (active_atoms(nnp%num_atoms))
+            ALLOCATE (active_flag(nnp%num_atoms))
+            ALLOCATE (denergydsym(max_nsym))
+            IF (calc_stress) ALLOCATE (stress(3, 3, max_nsym))
          END IF
       END IF
+
+      dsymdxyz(:, :, :) = 0.0_dp
+      active_flag(:) = 0
 
       ! calc atomic contribution to energy and force
       DO i = istart, istart + mecalc - 1
@@ -228,16 +230,6 @@ CONTAINS
 
       END DO ! loop over num_atoms
 
-      ! Free hoisted scratch buffers
-      IF (calc_forces) THEN
-         DEALLOCATE (dsymdxyz)
-         DEALLOCATE (active_atoms)
-         DEALLOCATE (active_flag)
-         DEALLOCATE (denergydsym)
-         IF (calc_stress) THEN
-            DEALLOCATE (stress)
-         END IF
-      END IF
 
       ! calculate energy:
       CALL logger%para_env%sum(nnp%atomic_energy(:, :))
