@@ -1,0 +1,11 @@
+# branch:    feature-verlet-cells
+# exe:       /local/data/public/crm98/original_cp2k/install/bin/cp2k.psmp
+# MPI ranks: 32
+# steps:     100
+# n_molecules,walltime_s
+64,2.921
+256,6.563
+512,9.878
+1024,23.362
+2048,40.602
+4096,90.517

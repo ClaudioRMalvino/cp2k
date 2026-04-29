@@ -86,6 +86,24 @@ MODULE nnp_acsf
       INTEGER, ALLOCATABLE                 :: next(:)                     ! (n_images)
    END TYPE nnp_cell_list_cache_type
 
+! **************************************************************************************************
+!> \brief Module-level cache for Hermite Cubic Splines to replace expensive intrinsic functions.
+!>        Stores coefficients (a, b, c, d) for Horner's method evaluation.
+! **************************************************************************************************
+   TYPE, PRIVATE :: nnp_spline_cache_type
+      LOGICAL                                :: initialized = .FALSE.
+      INTEGER                                :: n_points = 550
+      REAL(KIND=dp)                          :: dx_exp, inv_dx_exp, min_exp
+      REAL(KIND=dp)                          :: dx_cos, inv_dx_cos, min_cos, max_cos
+      REAL(KIND=dp)                          :: dx_tanh, inv_dx_tanh, min_tanh, max_tanh
+      
+      ! Dimension 1 is contiguous in memory (a, b, c, d). Dimension 2 is the grid index.
+      REAL(KIND=dp), ALLOCATABLE             :: coef_exp(:,:)
+      REAL(KIND=dp), ALLOCATABLE             :: coef_cos(:,:)
+      REAL(KIND=dp), ALLOCATABLE             :: coef_tanh(:,:)
+   END TYPE nnp_spline_cache_type
+
+   TYPE(nnp_spline_cache_type), SAVE, PRIVATE :: spline_cache
    TYPE(nnp_cell_list_cache_type), SAVE, PRIVATE :: cell_list_cache
 
    ! Persistent per-centre neighbour buffer, reused across all atoms in a force eval.
@@ -661,9 +679,9 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT), &
          OPTIONAL                                        :: force
 
-      INTEGER                                            :: k, sf
+      INTEGER                                            :: k, sf, idx
       REAL(KIND=dp)                                      :: dfcutdr, dsymdr, eta, fcut, funccut, rs, &
-                                                            tmp
+                                                            tmp, t, cos_val, dcos_dx, dexp_dx, tanh_val
       REAL(KIND=dp), DIMENSION(3)                        :: drdx
 
       !init
@@ -676,16 +694,39 @@ CONTAINS
       SELECT CASE (nnp%cut_type)
       CASE (nnp_cut_cos)
          tmp = pi*r/funccut
-         fcut = 0.5_dp*(COS(tmp) + 1.0_dp)
+         
+         idx = INT((tmp - spline_cache%min_cos) * spline_cache%inv_dx_cos) + 1
+         IF (idx < 1) idx = 1
+         IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
+         t = tmp - (spline_cache%min_cos + REAL(idx - 1, dp) * spline_cache%dx_cos)
+         
+         cos_val = spline_cache%coef_cos(1, idx) + t * (spline_cache%coef_cos(2, idx) + &
+                   t * (spline_cache%coef_cos(3, idx) + t * spline_cache%coef_cos(4, idx)))
+         
+         fcut = 0.5_dp*(cos_val + 1.0_dp)
+         
          IF (PRESENT(force)) THEN
-            dfcutdr = 0.5_dp*(-SIN(tmp))*(pi/funccut)
+            dcos_dx = spline_cache%coef_cos(2, idx) + t * (2.0_dp * spline_cache%coef_cos(3, idx) + &
+                      t * 3.0_dp * spline_cache%coef_cos(4, idx))
+            dfcutdr = 0.5_dp*(dcos_dx)*(pi/funccut)
          END IF
+
       CASE (nnp_cut_tanh)
-         tmp = TANH(1.0_dp - r/funccut)
-         fcut = tmp**3
+         tmp = 1.0_dp - r/funccut
+         
+         idx = INT((tmp - spline_cache%min_tanh) * spline_cache%inv_dx_tanh) + 1
+         IF (idx < 1) idx = 1
+         IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
+         t = tmp - (spline_cache%min_tanh + REAL(idx - 1, dp) * spline_cache%dx_tanh)
+         
+         tanh_val = spline_cache%coef_tanh(1, idx) + t * (spline_cache%coef_tanh(2, idx) + &
+                    t * (spline_cache%coef_tanh(3, idx) + t * spline_cache%coef_tanh(4, idx)))
+         
+         fcut = tanh_val**3
          IF (PRESENT(force)) THEN
-            dfcutdr = (-3.0_dp/funccut)*(tmp**2 - tmp**4)
+            dfcutdr = (-3.0_dp/funccut)*(tanh_val**2 - tanh_val**4)
          END IF
+
       CASE DEFAULT
          CPABORT("NNP| Cutoff function unknown")
       END SELECT
@@ -698,17 +739,35 @@ CONTAINS
          eta = nnp%rad(ind)%eta(k) !eta
          rs = nnp%rad(ind)%rs(k) !rshift
 
-         ! Calculate radial symmetry function
-         sym(sf) = EXP(-eta*(r - rs)**2)
-
-         ! Calculate partial derivatives of symmetry function and distance
-         ! and combine them to obtain force
-         IF (PRESENT(force)) THEN
-            dsymdr = sym(sf)*(-2.0_dp*eta*(r - rs))
-            force(:, sf) = fcut*dsymdr*drdx(:) + sym(sf)*dfcutdr*drdx(:)
+         tmp = -eta*(r - rs)**2
+         
+         ! Fast Spline Evaluation for EXP(tmp)
+         IF (tmp <= spline_cache%min_exp) THEN
+            sym(sf) = 0.0_dp
+            IF (PRESENT(force)) dsymdr = 0.0_dp
+         ELSE IF (tmp >= 0.0_dp) THEN
+            sym(sf) = 1.0_dp
+            IF (PRESENT(force)) dsymdr = 0.0_dp
+         ELSE
+            idx = INT((tmp - spline_cache%min_exp) * spline_cache%inv_dx_exp) + 1
+            IF (idx < 1) idx = 1
+            IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
+            t = tmp - (spline_cache%min_exp + REAL(idx - 1, dp) * spline_cache%dx_exp)
+            
+            sym(sf) = spline_cache%coef_exp(1, idx) + t * (spline_cache%coef_exp(2, idx) + &
+                      t * (spline_cache%coef_exp(3, idx) + t * spline_cache%coef_exp(4, idx)))
+            
+            IF (PRESENT(force)) THEN
+               dexp_dx = spline_cache%coef_exp(2, idx) + t * (2.0_dp * spline_cache%coef_exp(3, idx) + &
+                         t * 3.0_dp * spline_cache%coef_exp(4, idx))
+               dsymdr = dexp_dx * (-2.0_dp * eta * (r - rs))
+            END IF
          END IF
 
          ! combine radial symmetry function and cutoff function
+         IF (PRESENT(force)) THEN
+            force(:, sf) = fcut*dsymdr*drdx(:) + sym(sf)*dfcutdr*drdx(:)
+         END IF
          sym(sf) = sym(sf)*fcut
       END DO
 
@@ -741,10 +800,12 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(OUT), &
          OPTIONAL                                        :: force
 
-      INTEGER                                            :: i, m, sf
+      INTEGER                                            :: i, m, sf, idx
       REAL(KIND=dp) :: angular, costheta, dfcutdr1, dfcutdr2, dfcutdr3, dsymdr1, dsymdr2, dsymdr3, &
          eta, f, fcut, fcut1, fcut2, fcut3, ftot, g, lam, pref, prefzeta, rsqr1, rsqr2, rsqr3, &
-         symtmp, tmp, tmp1, tmp2, tmp3, tmpzeta, zeta
+         symtmp, tmp, tmp1, tmp2, tmp3, tmpzeta, zeta, t, dexp_dx
+      REAL(KIND=dp) :: dcos_dx1, dcos_dx2, dcos_dx3
+      REAL(KIND=dp) :: tanh_val1, tanh_val2, tanh_val3
       REAL(KIND=dp), DIMENSION(3) :: dangulardx1, dangulardx2, dangulardx3, dcosthetadx1, &
          dcosthetadx2, dcosthetadx3, dfdx1, dfdx2, dfdx3, dgdx1, dgdx2, dgdx3, dr1dx, dr2dx, dr3dx
 
@@ -765,9 +826,6 @@ CONTAINS
       dfcutdr3 = 0.0_dp
 
       ! Calculate cos(theta)
-      ! use law of cosine for theta
-      ! cos(ang(r1,r2)) = (r3**2 - r1**2 - r2**2)/(-2*r1*r2)
-      !                   |          f           |    g    |
       f = (rsqr3 - rsqr1 - rsqr2)
       g = -2.0_dp*r1*r2
       costheta = f/g
@@ -777,32 +835,70 @@ CONTAINS
       SELECT CASE (nnp%cut_type)
       CASE (nnp_cut_cos)
          tmp1 = pi*r1/fcut
+         idx = INT((tmp1 - spline_cache%min_cos) * spline_cache%inv_dx_cos) + 1
+         IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
+         t = tmp1 - (spline_cache%min_cos + REAL(idx - 1, dp) * spline_cache%dx_cos)
+         fcut1 = 0.5_dp * (spline_cache%coef_cos(1, idx) + t * (spline_cache%coef_cos(2, idx) + &
+                 t * (spline_cache%coef_cos(3, idx) + t * spline_cache%coef_cos(4, idx))) + 1.0_dp)
+         IF (PRESENT(force)) dcos_dx1 = spline_cache%coef_cos(2, idx) + t * (2.0_dp * spline_cache%coef_cos(3, idx) + t * 3.0_dp * spline_cache%coef_cos(4, idx))
+
          tmp2 = pi*r2/fcut
+         idx = INT((tmp2 - spline_cache%min_cos) * spline_cache%inv_dx_cos) + 1
+         IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
+         t = tmp2 - (spline_cache%min_cos + REAL(idx - 1, dp) * spline_cache%dx_cos)
+         fcut2 = 0.5_dp * (spline_cache%coef_cos(1, idx) + t * (spline_cache%coef_cos(2, idx) + &
+                 t * (spline_cache%coef_cos(3, idx) + t * spline_cache%coef_cos(4, idx))) + 1.0_dp)
+         IF (PRESENT(force)) dcos_dx2 = spline_cache%coef_cos(2, idx) + t * (2.0_dp * spline_cache%coef_cos(3, idx) + t * 3.0_dp * spline_cache%coef_cos(4, idx))
+
          tmp3 = pi*r3/fcut
-         fcut1 = 0.5_dp*(COS(tmp1) + 1.0_dp)
-         fcut2 = 0.5_dp*(COS(tmp2) + 1.0_dp)
-         fcut3 = 0.5_dp*(COS(tmp3) + 1.0_dp)
+         idx = INT((tmp3 - spline_cache%min_cos) * spline_cache%inv_dx_cos) + 1
+         IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
+         t = tmp3 - (spline_cache%min_cos + REAL(idx - 1, dp) * spline_cache%dx_cos)
+         fcut3 = 0.5_dp * (spline_cache%coef_cos(1, idx) + t * (spline_cache%coef_cos(2, idx) + &
+                 t * (spline_cache%coef_cos(3, idx) + t * spline_cache%coef_cos(4, idx))) + 1.0_dp)
+         IF (PRESENT(force)) dcos_dx3 = spline_cache%coef_cos(2, idx) + t * (2.0_dp * spline_cache%coef_cos(3, idx) + t * 3.0_dp * spline_cache%coef_cos(4, idx))
+
          ftot = fcut1*fcut2*fcut3
          IF (PRESENT(force)) THEN
             pref = 0.5_dp*(pi/fcut)
-            dfcutdr1 = pref*(-SIN(tmp1))*fcut2*fcut3
-            dfcutdr2 = pref*(-SIN(tmp2))*fcut1*fcut3
-            dfcutdr3 = pref*(-SIN(tmp3))*fcut1*fcut2
+            dfcutdr1 = pref*(dcos_dx1)*fcut2*fcut3
+            dfcutdr2 = pref*(dcos_dx2)*fcut1*fcut3
+            dfcutdr3 = pref*(dcos_dx3)*fcut1*fcut2
          END IF
+
       CASE (nnp_cut_tanh)
-         tmp1 = TANH(1.0_dp - r1/fcut)
-         tmp2 = TANH(1.0_dp - r2/fcut)
-         tmp3 = TANH(1.0_dp - r3/fcut)
-         fcut1 = tmp1**3
-         fcut2 = tmp2**3
-         fcut3 = tmp3**3
+         tmp1 = 1.0_dp - r1/fcut
+         idx = INT((tmp1 - spline_cache%min_tanh) * spline_cache%inv_dx_tanh) + 1
+         IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
+         t = tmp1 - (spline_cache%min_tanh + REAL(idx - 1, dp) * spline_cache%dx_tanh)
+         tanh_val1 = spline_cache%coef_tanh(1, idx) + t * (spline_cache%coef_tanh(2, idx) + &
+                     t * (spline_cache%coef_tanh(3, idx) + t * spline_cache%coef_tanh(4, idx)))
+         fcut1 = tanh_val1**3
+
+         tmp2 = 1.0_dp - r2/fcut
+         idx = INT((tmp2 - spline_cache%min_tanh) * spline_cache%inv_dx_tanh) + 1
+         IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
+         t = tmp2 - (spline_cache%min_tanh + REAL(idx - 1, dp) * spline_cache%dx_tanh)
+         tanh_val2 = spline_cache%coef_tanh(1, idx) + t * (spline_cache%coef_tanh(2, idx) + &
+                     t * (spline_cache%coef_tanh(3, idx) + t * spline_cache%coef_tanh(4, idx)))
+         fcut2 = tanh_val2**3
+
+         tmp3 = 1.0_dp - r3/fcut
+         idx = INT((tmp3 - spline_cache%min_tanh) * spline_cache%inv_dx_tanh) + 1
+         IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
+         t = tmp3 - (spline_cache%min_tanh + REAL(idx - 1, dp) * spline_cache%dx_tanh)
+         tanh_val3 = spline_cache%coef_tanh(1, idx) + t * (spline_cache%coef_tanh(2, idx) + &
+                     t * (spline_cache%coef_tanh(3, idx) + t * spline_cache%coef_tanh(4, idx)))
+         fcut3 = tanh_val3**3
+
          ftot = fcut1*fcut2*fcut3
          IF (PRESENT(force)) THEN
             pref = -3.0_dp/fcut
-            dfcutdr1 = pref*(tmp1**2 - tmp1**4)*fcut2*fcut3
-            dfcutdr2 = pref*(tmp2**2 - tmp2**4)*fcut1*fcut3
-            dfcutdr3 = pref*(tmp3**2 - tmp3**4)*fcut1*fcut2
+            dfcutdr1 = pref*(tanh_val1**2 - tanh_val1**4)*fcut2*fcut3
+            dfcutdr2 = pref*(tanh_val2**2 - tanh_val2**4)*fcut1*fcut3
+            dfcutdr3 = pref*(tanh_val3**2 - tanh_val3**4)*fcut1*fcut2
          END IF
+
       CASE DEFAULT
          CPABORT("NNP| Cutoff function unknown")
       END SELECT
@@ -829,21 +925,37 @@ CONTAINS
             CYCLE
          END IF
 
-         ! Calculate symmetry function
          ! Calculate angular symmetry function
-         ! ang = (1+lam*cos(theta_ijk))**zeta
          i = NINT(zeta)
          IF (1.0_dp*i == zeta) THEN
-            tmpzeta = tmp**(i - 1)   ! integer power is a LOT faster
+            tmpzeta = tmp**(i - 1)   
          ELSE
             tmpzeta = tmp**(zeta - 1.0_dp)
          END IF
          angular = tmpzeta*tmp
-         ! exponential part:
-         ! exp(-eta*(r1**2+r2**2+r3**2))
-         symtmp = EXP(-eta*(rsqr1 + rsqr2 + rsqr3))
+         
+         ! Spline Evaluation for EXP
+         tmp = -eta*(rsqr1 + rsqr2 + rsqr3)
+         IF (tmp <= spline_cache%min_exp) THEN
+            symtmp = 0.0_dp
+            IF (PRESENT(force)) dexp_dx = 0.0_dp
+         ELSE IF (tmp >= 0.0_dp) THEN
+            symtmp = 1.0_dp
+            IF (PRESENT(force)) dexp_dx = 0.0_dp
+         ELSE
+            idx = INT((tmp - spline_cache%min_exp) * spline_cache%inv_dx_exp) + 1
+            IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
+            t = tmp - (spline_cache%min_exp + REAL(idx - 1, dp) * spline_cache%dx_exp)
+            
+            symtmp = spline_cache%coef_exp(1, idx) + t * (spline_cache%coef_exp(2, idx) + &
+                     t * (spline_cache%coef_exp(3, idx) + t * spline_cache%coef_exp(4, idx)))
+            
+            IF (PRESENT(force)) THEN
+               dexp_dx = spline_cache%coef_exp(2, idx) + t * (2.0_dp * spline_cache%coef_exp(3, idx) + &
+                         t * 3.0_dp * spline_cache%coef_exp(4, idx))
+            END IF
+         END IF
 
-         ! Partial derivatives (f/g)' = (f'g - fg')/g^2
          IF (PRESENT(force)) THEN
             pref = zeta*(tmpzeta)/g**2
             DO i = 1, 3
@@ -866,19 +978,12 @@ CONTAINS
                dangulardx3(i) = pref*dcosthetadx3(i)
             END DO
 
-            ! Calculate partial derivatives of exponential part and distance
-            ! and combine partial derivatives to obtain force
             pref = prefzeta
-            tmp = -2.0_dp*symtmp*eta
+            tmp = -2.0_dp * dexp_dx * eta
             dsymdr1 = tmp*r1
             dsymdr2 = tmp*r2
             dsymdr3 = tmp*r3
 
-            ! G(r1,r2,r3) = pref*angular(r1,r2,r3)*exp(r1,r2,r3)*fcut(r1,r2,r3)
-            ! dG/dx1 = (dangular/dx1*  exp    *    fcut   +
-            !            angular    * dexp/dx1*    fcut   +
-            !            angular    *  exp    *  dfcut/dx1)*pref
-            ! dr1/dx1 = -dr1/dx2
             tmp = pref*symtmp*ftot
             tmp1 = pref*angular*(ftot*dsymdr1 + dfcutdr1*symtmp)
             tmp2 = pref*angular*(ftot*dsymdr2 + dfcutdr2*symtmp)
@@ -890,9 +995,7 @@ CONTAINS
             END DO
          END IF
 
-         ! Don't forget prefactor: 2**(1-ang%zeta)
          pref = prefzeta
-         ! combine angular and exponential part with cutoff function
          sym(sf) = pref*angular*symtmp*ftot
       END DO
 
@@ -1198,8 +1301,9 @@ CONTAINS
 
    END SUBROUTINE nnp_swapang
 
+
 ! **************************************************************************************************
-!> \brief Initialize symmetry function groups
+!> \brief Initialize symmetry function groups and pre-calculate Hermite Splines
 !> \param nnp ...
 !> \date   2020-10-10
 !> \author Christoph Schran (christoph.schran@rub.de)
@@ -1210,6 +1314,9 @@ CONTAINS
 
       INTEGER                                            :: ang, i, j, k, rad, s
       REAL(KIND=dp)                                      :: funccut
+
+      ! Variables for inline Spline Initialization
+      REAL(KIND=dp)                                      :: x0, x1, y0, y1, m0, m1, h
 
       !find out how many symmetry functions groups are needed
       DO i = 1, nnp%n_ele
@@ -1335,6 +1442,69 @@ CONTAINS
             END DO
          END DO
       END DO
+
+      ! -------------------------------------------------------------------------
+      ! Inline Hermite Spline Initialization
+      ! -------------------------------------------------------------------------
+      IF (.NOT. spline_cache%initialized) THEN
+         ! Setup EXP spline
+         spline_cache%min_exp = -50.0_dp
+         spline_cache%dx_exp = ABS(spline_cache%min_exp) / REAL(spline_cache%n_points - 1, dp)
+         spline_cache%inv_dx_exp = 1.0_dp / spline_cache%dx_exp
+         ALLOCATE(spline_cache%coef_exp(4, spline_cache%n_points - 1))
+
+         h = spline_cache%dx_exp
+         DO i = 1, spline_cache%n_points - 1
+            x0 = spline_cache%min_exp + REAL(i - 1, dp) * h
+            x1 = x0 + h
+            y0 = EXP(x0); m0 = EXP(x0)
+            y1 = EXP(x1); m1 = EXP(x1)
+            spline_cache%coef_exp(1, i) = y0
+            spline_cache%coef_exp(2, i) = m0
+            spline_cache%coef_exp(3, i) = (3.0_dp*(y1 - y0) / (h*h)) - ((2.0_dp*m0 + m1) / h)
+            spline_cache%coef_exp(4, i) = (2.0_dp*(y0 - y1) / (h*h*h)) + ((m0 + m1) / (h*h))
+         END DO
+
+         ! Setup COS spline
+         spline_cache%min_cos = -acos(-1.0_dp)   
+         spline_cache%max_cos =  acos(-1.0_dp)   
+         spline_cache%dx_cos = (spline_cache%max_cos - spline_cache%min_cos) / REAL(spline_cache%n_points - 1, dp)
+         spline_cache%inv_dx_cos = 1.0_dp / spline_cache%dx_cos
+         ALLOCATE(spline_cache%coef_cos(4, spline_cache%n_points - 1))
+
+         h = spline_cache%dx_cos
+         DO i = 1, spline_cache%n_points - 1
+            x0 = spline_cache%min_cos + REAL(i - 1, dp) * h
+            x1 = x0 + h
+            y0 = COS(x0); m0 = -SIN(x0)
+            y1 = COS(x1); m1 = -SIN(x1)
+            spline_cache%coef_cos(1, i) = y0
+            spline_cache%coef_cos(2, i) = m0
+            spline_cache%coef_cos(3, i) = (3.0_dp*(y1 - y0) / (h*h)) - ((2.0_dp*m0 + m1) / h)
+            spline_cache%coef_cos(4, i) = (2.0_dp*(y0 - y1) / (h*h*h)) + ((m0 + m1) / (h*h))
+         END DO
+
+         ! Setup TANH spline
+         spline_cache%min_tanh = -10.0_dp
+         spline_cache%max_tanh =  10.0_dp
+         spline_cache%dx_tanh = (spline_cache%max_tanh - spline_cache%min_tanh) / REAL(spline_cache%n_points - 1, dp)
+         spline_cache%inv_dx_tanh = 1.0_dp / spline_cache%dx_tanh
+         ALLOCATE(spline_cache%coef_tanh(4, spline_cache%n_points - 1))
+
+         h = spline_cache%dx_tanh
+         DO i = 1, spline_cache%n_points - 1
+            x0 = spline_cache%min_tanh + REAL(i - 1, dp) * h
+            x1 = x0 + h
+            y0 = TANH(x0); m0 = 1.0_dp - y0*y0
+            y1 = TANH(x1); m1 = 1.0_dp - y1*y1
+            spline_cache%coef_tanh(1, i) = y0
+            spline_cache%coef_tanh(2, i) = m0
+            spline_cache%coef_tanh(3, i) = (3.0_dp*(y1 - y0) / (h*h)) - ((2.0_dp*m0 + m1) / h)
+            spline_cache%coef_tanh(4, i) = (2.0_dp*(y0 - y1) / (h*h*h)) + ((m0 + m1) / (h*h))
+         END DO
+         
+         spline_cache%initialized = .TRUE.
+      END IF
 
    END SUBROUTINE nnp_init_acsf_groups
 
