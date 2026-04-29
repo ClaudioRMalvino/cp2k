@@ -206,6 +206,13 @@ MODULE nnp_environment_types
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: funccut
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: eta
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: zeta
+      ! Precomputed companions to zeta (set in nnp_init_acsf_groups, after sort):
+      !   zeta_int(:)    = NINT(zeta)
+      !   zeta_is_int(:) = .TRUE. when zeta is integer-valued (always true for typical NNPs;
+      !                    integer power is much faster than the libm pow() call required for
+      !                    real exponents).  Removes NINT + FP-equality check from the inner sf loop.
+      INTEGER, ALLOCATABLE, DIMENSION(:)                  :: zeta_int
+      LOGICAL, ALLOCATABLE, DIMENSION(:)                  :: zeta_is_int
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: prefzeta
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: lam
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: loc_min
@@ -310,6 +317,8 @@ CONTAINS
                         nnp_env%ang(i)%funccut, &
                         nnp_env%ang(i)%eta, &
                         nnp_env%ang(i)%zeta, &
+                        nnp_env%ang(i)%zeta_int, &
+                        nnp_env%ang(i)%zeta_is_int, &
                         nnp_env%ang(i)%prefzeta, &
                         nnp_env%ang(i)%lam, &
                         nnp_env%ang(i)%loc_min, &

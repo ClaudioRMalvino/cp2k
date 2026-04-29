@@ -522,6 +522,8 @@ CONTAINS
          ALLOCATE (nnp_env%ang(i)%funccut(nnp_env%n_ang(i)))
          ALLOCATE (nnp_env%ang(i)%eta(nnp_env%n_ang(i)))
          ALLOCATE (nnp_env%ang(i)%zeta(nnp_env%n_ang(i)))
+         ALLOCATE (nnp_env%ang(i)%zeta_int(nnp_env%n_ang(i)))
+         ALLOCATE (nnp_env%ang(i)%zeta_is_int(nnp_env%n_ang(i)))
          ALLOCATE (nnp_env%ang(i)%prefzeta(nnp_env%n_ang(i)))
          ALLOCATE (nnp_env%ang(i)%lam(nnp_env%n_ang(i)))
          ALLOCATE (nnp_env%ang(i)%loc_min(nnp_env%n_ang(i)))

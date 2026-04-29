@@ -92,7 +92,7 @@ MODULE nnp_acsf
 ! **************************************************************************************************
    TYPE, PRIVATE :: nnp_spline_cache_type
       LOGICAL                                :: initialized = .FALSE.
-      INTEGER                                :: n_points = 550
+      INTEGER                                :: n_points = 5000
       REAL(KIND=dp)                          :: dx_exp, inv_dx_exp, min_exp
       REAL(KIND=dp)                          :: dx_cos, inv_dx_cos, min_cos, max_cos
       REAL(KIND=dp)                          :: dx_tanh, inv_dx_tanh, min_tanh, max_tanh
@@ -681,7 +681,7 @@ CONTAINS
 
       INTEGER                                            :: k, sf, idx
       REAL(KIND=dp)                                      :: dfcutdr, dsymdr, eta, fcut, funccut, rs, &
-                                                            tmp, t, cos_val, dcos_dx, dexp_dx, tanh_val
+                                                            tmp, t, cos_val, dcos_dx, tanh_val, rinv
       REAL(KIND=dp), DIMENSION(3)                        :: drdx
 
       !init
@@ -731,7 +731,13 @@ CONTAINS
          CPABORT("NNP| Cutoff function unknown")
       END SELECT
 
-      IF (PRESENT(force)) drdx(:) = rvect(:)/r
+      ! 1 division -> 3 multiplies (division is ~6x slower on x86)
+      IF (PRESENT(force)) THEN
+         rinv = 1.0_dp/r
+         drdx(1) = rvect(1)*rinv
+         drdx(2) = rvect(2)*rinv
+         drdx(3) = rvect(3)*rinv
+      END IF
 
       !loop over sym fncts of sym fnct group s
       DO sf = 1, nnp%rad(ind)%symfgrp(s)%n_symf
@@ -740,8 +746,11 @@ CONTAINS
          rs = nnp%rad(ind)%rs(k) !rshift
 
          tmp = -eta*(r - rs)**2
-         
-         ! Fast Spline Evaluation for EXP(tmp)
+
+         ! Fast Spline Evaluation for EXP(tmp).  We use sym(sf) (the spline value, ~EXP(tmp))
+         ! directly in the chain rule instead of evaluating the spline derivative — the
+         ! Hermite cubic value has O(h^4) error vs O(h^3) for its formal derivative, so this
+         ! is both faster (skip 4 mul + 2 add) and slightly more accurate.
          IF (tmp <= spline_cache%min_exp) THEN
             sym(sf) = 0.0_dp
             IF (PRESENT(force)) dsymdr = 0.0_dp
@@ -749,19 +758,15 @@ CONTAINS
             sym(sf) = 1.0_dp
             IF (PRESENT(force)) dsymdr = 0.0_dp
          ELSE
-            idx = INT((tmp - spline_cache%min_exp) * spline_cache%inv_dx_exp) + 1
+            idx = INT((tmp - spline_cache%min_exp)*spline_cache%inv_dx_exp) + 1
             IF (idx < 1) idx = 1
             IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
-            t = tmp - (spline_cache%min_exp + REAL(idx - 1, dp) * spline_cache%dx_exp)
-            
-            sym(sf) = spline_cache%coef_exp(1, idx) + t * (spline_cache%coef_exp(2, idx) + &
-                      t * (spline_cache%coef_exp(3, idx) + t * spline_cache%coef_exp(4, idx)))
-            
-            IF (PRESENT(force)) THEN
-               dexp_dx = spline_cache%coef_exp(2, idx) + t * (2.0_dp * spline_cache%coef_exp(3, idx) + &
-                         t * 3.0_dp * spline_cache%coef_exp(4, idx))
-               dsymdr = dexp_dx * (-2.0_dp * eta * (r - rs))
-            END IF
+            t = tmp - (spline_cache%min_exp + REAL(idx - 1, dp)*spline_cache%dx_exp)
+
+            sym(sf) = spline_cache%coef_exp(1, idx) + t*(spline_cache%coef_exp(2, idx) + &
+                      t*(spline_cache%coef_exp(3, idx) + t*spline_cache%coef_exp(4, idx)))
+
+            IF (PRESENT(force)) dsymdr = sym(sf)*(-2.0_dp*eta*(r - rs))
          END IF
 
          ! combine radial symmetry function and cutoff function
@@ -802,8 +807,8 @@ CONTAINS
 
       INTEGER                                            :: i, m, sf, idx
       REAL(KIND=dp) :: angular, costheta, dfcutdr1, dfcutdr2, dfcutdr3, dsymdr1, dsymdr2, dsymdr3, &
-         eta, f, fcut, fcut1, fcut2, fcut3, ftot, g, lam, pref, prefzeta, rsqr1, rsqr2, rsqr3, &
-         symtmp, tmp, tmp1, tmp2, tmp3, tmpzeta, zeta, t, dexp_dx
+         eta, f, fcut, fcut1, fcut2, fcut3, ftot, g, g_sq_inv, lam, pref, prefzeta, rsqr1, rsqr2, &
+         rsqr3, r_sum_sq, r1inv, r2inv, r3inv, symtmp, tmp, tmp1, tmp2, tmp3, tmpzeta, zeta, t
       REAL(KIND=dp) :: dcos_dx1, dcos_dx2, dcos_dx3
       REAL(KIND=dp) :: tanh_val1, tanh_val2, tanh_val3
       REAL(KIND=dp), DIMENSION(3) :: dangulardx1, dangulardx2, dangulardx3, dcosthetadx1, &
@@ -840,7 +845,8 @@ CONTAINS
          t = tmp1 - (spline_cache%min_cos + REAL(idx - 1, dp) * spline_cache%dx_cos)
          fcut1 = 0.5_dp * (spline_cache%coef_cos(1, idx) + t * (spline_cache%coef_cos(2, idx) + &
                  t * (spline_cache%coef_cos(3, idx) + t * spline_cache%coef_cos(4, idx))) + 1.0_dp)
-         IF (PRESENT(force)) dcos_dx1 = spline_cache%coef_cos(2, idx) + t * (2.0_dp * spline_cache%coef_cos(3, idx) + t * 3.0_dp * spline_cache%coef_cos(4, idx))
+         IF (PRESENT(force)) dcos_dx1 = spline_cache%coef_cos(2, idx) + & 
+         t * (2.0_dp * spline_cache%coef_cos(3, idx) + t * 3.0_dp * spline_cache%coef_cos(4, idx))
 
          tmp2 = pi*r2/fcut
          idx = INT((tmp2 - spline_cache%min_cos) * spline_cache%inv_dx_cos) + 1
@@ -848,7 +854,8 @@ CONTAINS
          t = tmp2 - (spline_cache%min_cos + REAL(idx - 1, dp) * spline_cache%dx_cos)
          fcut2 = 0.5_dp * (spline_cache%coef_cos(1, idx) + t * (spline_cache%coef_cos(2, idx) + &
                  t * (spline_cache%coef_cos(3, idx) + t * spline_cache%coef_cos(4, idx))) + 1.0_dp)
-         IF (PRESENT(force)) dcos_dx2 = spline_cache%coef_cos(2, idx) + t * (2.0_dp * spline_cache%coef_cos(3, idx) + t * 3.0_dp * spline_cache%coef_cos(4, idx))
+         IF (PRESENT(force)) dcos_dx2 = spline_cache%coef_cos(2, idx) + &
+               t * (2.0_dp * spline_cache%coef_cos(3, idx) + t * 3.0_dp * spline_cache%coef_cos(4, idx))
 
          tmp3 = pi*r3/fcut
          idx = INT((tmp3 - spline_cache%min_cos) * spline_cache%inv_dx_cos) + 1
@@ -856,7 +863,8 @@ CONTAINS
          t = tmp3 - (spline_cache%min_cos + REAL(idx - 1, dp) * spline_cache%dx_cos)
          fcut3 = 0.5_dp * (spline_cache%coef_cos(1, idx) + t * (spline_cache%coef_cos(2, idx) + &
                  t * (spline_cache%coef_cos(3, idx) + t * spline_cache%coef_cos(4, idx))) + 1.0_dp)
-         IF (PRESENT(force)) dcos_dx3 = spline_cache%coef_cos(2, idx) + t * (2.0_dp * spline_cache%coef_cos(3, idx) + t * 3.0_dp * spline_cache%coef_cos(4, idx))
+         IF (PRESENT(force)) dcos_dx3 = spline_cache%coef_cos(2, idx) + &
+                  t * (2.0_dp * spline_cache%coef_cos(3, idx) + t * 3.0_dp * spline_cache%coef_cos(4, idx))
 
          ftot = fcut1*fcut2*fcut3
          IF (PRESENT(force)) THEN
@@ -904,10 +912,20 @@ CONTAINS
       END SELECT
 
       IF (PRESENT(force)) THEN
-         dr1dx(:) = rvect1(:)/r1
-         dr2dx(:) = rvect2(:)/r2
-         dr3dx(:) = rvect3(:)/r3
+         ! 1 division -> 3 multiplies per pair-distance
+         r1inv = 1.0_dp/r1
+         r2inv = 1.0_dp/r2
+         r3inv = 1.0_dp/r3
+         dr1dx(1) = rvect1(1)*r1inv; dr1dx(2) = rvect1(2)*r1inv; dr1dx(3) = rvect1(3)*r1inv
+         dr2dx(1) = rvect2(1)*r2inv; dr2dx(2) = rvect2(2)*r2inv; dr2dx(3) = rvect2(3)*r2inv
+         dr3dx(1) = rvect3(1)*r3inv; dr3dx(2) = rvect3(2)*r3inv; dr3dx(3) = rvect3(3)*r3inv
       END IF
+
+      ! Hoist invariants out of the sf loop:
+      !  * r_sum_sq = r1^2 + r2^2 + r3^2 (the EXP argument is -eta*r_sum_sq, only eta varies per sf)
+      !  * g_sq_inv = 1/g^2 (used in dangular/dr; g = -2 r1 r2 doesn't depend on sf)
+      r_sum_sq = rsqr1 + rsqr2 + rsqr3
+      g_sq_inv = 1.0_dp/(g*g)
 
       !loop over associated sym fncts
       DO sf = 1, nnp%ang(ind)%symfgrp(s)%n_symf
@@ -925,39 +943,35 @@ CONTAINS
             CYCLE
          END IF
 
-         ! Calculate angular symmetry function
-         i = NINT(zeta)
-         IF (1.0_dp*i == zeta) THEN
-            tmpzeta = tmp**(i - 1)   
+         ! Calculate angular symmetry function.  zeta_is_int / zeta_int are precomputed once
+         ! at init from the (post-sort) zeta values; no NINT or FP-equality test in the hot loop.
+         IF (nnp%ang(ind)%zeta_is_int(m)) THEN
+            tmpzeta = tmp**(nnp%ang(ind)%zeta_int(m) - 1)
          ELSE
             tmpzeta = tmp**(zeta - 1.0_dp)
          END IF
          angular = tmpzeta*tmp
-         
-         ! Spline Evaluation for EXP
-         tmp = -eta*(rsqr1 + rsqr2 + rsqr3)
+
+         ! Spline Evaluation for EXP.  Use symtmp (~EXP value) for the chain rule below
+         ! instead of evaluating the spline derivative separately — same answer, slightly
+         ! more accurate (O(h^4) value vs O(h^3) formal derivative).
+         tmp = -eta*r_sum_sq
          IF (tmp <= spline_cache%min_exp) THEN
             symtmp = 0.0_dp
-            IF (PRESENT(force)) dexp_dx = 0.0_dp
          ELSE IF (tmp >= 0.0_dp) THEN
             symtmp = 1.0_dp
-            IF (PRESENT(force)) dexp_dx = 0.0_dp
          ELSE
-            idx = INT((tmp - spline_cache%min_exp) * spline_cache%inv_dx_exp) + 1
-            IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
-            t = tmp - (spline_cache%min_exp + REAL(idx - 1, dp) * spline_cache%dx_exp)
-            
-            symtmp = spline_cache%coef_exp(1, idx) + t * (spline_cache%coef_exp(2, idx) + &
-                     t * (spline_cache%coef_exp(3, idx) + t * spline_cache%coef_exp(4, idx)))
-            
-            IF (PRESENT(force)) THEN
-               dexp_dx = spline_cache%coef_exp(2, idx) + t * (2.0_dp * spline_cache%coef_exp(3, idx) + &
-                         t * 3.0_dp * spline_cache%coef_exp(4, idx))
-            END IF
+            idx = INT((tmp - spline_cache%min_exp)*spline_cache%inv_dx_exp) + 1
+            IF (idx < 1) idx = 1
+            IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
+            t = tmp - (spline_cache%min_exp + REAL(idx - 1, dp)*spline_cache%dx_exp)
+
+            symtmp = spline_cache%coef_exp(1, idx) + t*(spline_cache%coef_exp(2, idx) + &
+                     t*(spline_cache%coef_exp(3, idx) + t*spline_cache%coef_exp(4, idx)))
          END IF
 
          IF (PRESENT(force)) THEN
-            pref = zeta*(tmpzeta)/g**2
+            pref = zeta*tmpzeta*g_sq_inv
             DO i = 1, 3
                dfdx1(i) = -2.0_dp*lam*(rvect1(i) + rvect2(i))
                dfdx2(i) = 2.0_dp*lam*(rvect3(i) + rvect1(i))
@@ -979,7 +993,7 @@ CONTAINS
             END DO
 
             pref = prefzeta
-            tmp = -2.0_dp * dexp_dx * eta
+            tmp = -2.0_dp*symtmp*eta
             dsymdr1 = tmp*r1
             dsymdr2 = tmp*r2
             dsymdr3 = tmp*r3
@@ -1312,11 +1326,21 @@ CONTAINS
 
       TYPE(nnp_type), INTENT(INOUT)                      :: nnp
 
-      INTEGER                                            :: ang, i, j, k, rad, s
+      INTEGER                                            :: ang, i, j, k, rad, s, zint
       REAL(KIND=dp)                                      :: funccut
 
       ! Variables for inline Spline Initialization
       REAL(KIND=dp)                                      :: x0, x1, y0, y1, m0, m1, h
+
+      ! Precompute integer-zeta companions (NINT and is-integer flag) once.  Sort has already
+      ! finalised the order of zeta(:) by the time this routine runs, so a single pass suffices.
+      DO i = 1, nnp%n_ele
+         DO s = 1, nnp%n_ang(i)
+            zint = NINT(nnp%ang(i)%zeta(s))
+            nnp%ang(i)%zeta_int(s) = zint
+            nnp%ang(i)%zeta_is_int(s) = (REAL(zint, dp) == nnp%ang(i)%zeta(s))
+         END DO
+      END DO
 
       !find out how many symmetry functions groups are needed
       DO i = 1, nnp%n_ele
@@ -1465,9 +1489,12 @@ CONTAINS
             spline_cache%coef_exp(4, i) = (2.0_dp*(y0 - y1) / (h*h*h)) + ((m0 + m1) / (h*h))
          END DO
 
-         ! Setup COS spline
-         spline_cache%min_cos = -acos(-1.0_dp)   
-         spline_cache%max_cos =  acos(-1.0_dp)   
+         ! Setup COS spline.  Cutoff usage is f_c(x) = 0.5*(cos(pi*x) + 1) for x = r/cutoff in
+         ! [0, 1), so the spline argument tmp = pi*r/cutoff lives in [0, pi] only.  Using [0, pi]
+         ! instead of [-pi, pi] doubles the resolution at the same n_points (~16x improvement
+         ! in pointwise Hermite-cubic error, since error scales as h^4).
+         spline_cache%min_cos = 0.0_dp
+         spline_cache%max_cos = acos(-1.0_dp)
          spline_cache%dx_cos = (spline_cache%max_cos - spline_cache%min_cos) / REAL(spline_cache%n_points - 1, dp)
          spline_cache%inv_dx_cos = 1.0_dp / spline_cache%dx_cos
          ALLOCATE(spline_cache%coef_cos(4, spline_cache%n_points - 1))
@@ -1484,9 +1511,12 @@ CONTAINS
             spline_cache%coef_cos(4, i) = (2.0_dp*(y0 - y1) / (h*h*h)) + ((m0 + m1) / (h*h))
          END DO
 
-         ! Setup TANH spline
-         spline_cache%min_tanh = -10.0_dp
-         spline_cache%max_tanh =  10.0_dp
+         ! Setup TANH spline.  Cutoff usage is f_c(x) = tanh^3(1 - x) for x = r/cutoff in [0, 1),
+         ! so the spline argument tmp = 1 - r/cutoff lives in [0, 1] only.  Using [0, 1] instead
+         ! of [-10, 10] gives ~20x finer resolution at the same n_points (~1.6e5 improvement in
+         ! pointwise error, way past what the regtest tolerance demands).
+         spline_cache%min_tanh = 0.0_dp
+         spline_cache%max_tanh = 1.0_dp
          spline_cache%dx_tanh = (spline_cache%max_tanh - spline_cache%min_tanh) / REAL(spline_cache%n_points - 1, dp)
          spline_cache%inv_dx_tanh = 1.0_dp / spline_cache%dx_tanh
          ALLOCATE(spline_cache%coef_tanh(4, spline_cache%n_points - 1))

@@ -156,6 +156,8 @@ CONTAINS
          ALLOCATE (active_atoms(nnp%num_atoms))
          ALLOCATE (active_flag(nnp%num_atoms))
          active_flag(:) = 0
+         ! Hoisted: avoid 6k * n_committee tiny ALLOCATE/DEALLOCATEs per step
+         ALLOCATE (denergydsym(max_nsym))
          IF (calc_stress) THEN
             ALLOCATE (stress(3, 3, max_nsym))
          END IF
@@ -197,8 +199,7 @@ CONTAINS
             ! predict forces — restrict the accumulation to atoms touched by this centre's
             ! neighbour walk (active_atoms).  Drops O(num_atoms) inner loop to O(n_active).
             IF (calc_forces) THEN
-               ALLOCATE (denergydsym(nnp%arc(ind)%n_nodes(1)))
-               denergydsym(:) = 0.0_dp
+               denergydsym(1:nnp%arc(ind)%n_nodes(1)) = 0.0_dp
                CALL nnp_gradients(nnp%arc(ind), nnp, i_com, denergydsym)
                DO j = 1, nnp%arc(ind)%n_nodes(1)
                   DO idx = 1, n_active
@@ -212,7 +213,6 @@ CONTAINS
                                                          denergydsym(j)*stress(:, :, j)
                   END IF
                END DO
-               DEALLOCATE (denergydsym)
             END IF
          END DO
 
@@ -233,6 +233,7 @@ CONTAINS
          DEALLOCATE (dsymdxyz)
          DEALLOCATE (active_atoms)
          DEALLOCATE (active_flag)
+         DEALLOCATE (denergydsym)
          IF (calc_stress) THEN
             DEALLOCATE (stress)
          END IF

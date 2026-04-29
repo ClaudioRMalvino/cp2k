@@ -40,6 +40,7 @@ fi
   --with-gcc=system \
   --with-openmpi=system \
   --with-openblas=system \
+  --with-scalapack=system \
   --math-mode=openblas \
   --with-elpa=no \
   --with-sirius=no
