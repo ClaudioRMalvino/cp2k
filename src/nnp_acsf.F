@@ -146,9 +146,9 @@ CONTAINS
       INTEGER                                            :: handle, handle_sf, ind, j, jj, k, kk, l, &
                                                             m, off, s, sf
       REAL(KIND=dp)                                      :: r1, r2, r3
-      REAL(KIND=dp), DIMENSION(:), POINTER               :: symtmp
-      REAL(KIND=dp), DIMENSION(:, :), POINTER            :: forcetmp
-      REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: force3tmp
+      REAL(KIND=dp), DIMENSION(:), POINTER, CONTIGUOUS   :: symtmp
+      REAL(KIND=dp), DIMENSION(:, :), POINTER, CONTIGUOUS :: forcetmp
+      REAL(KIND=dp), DIMENSION(:, :, :), POINTER, CONTIGUOUS :: force3tmp
       REAL(KIND=dp), DIMENSION(3)                        :: rvect1, rvect2, rvect3
       TYPE(nnp_neighbor_type), POINTER                   :: neighbor
 
