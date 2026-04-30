@@ -168,6 +168,9 @@ flycheck_*.el
 
 
 ### Fortran ###
+# Fortran Language Server 
+.fortls
+
 # Prerequisites
 
 # Compiled Object files
