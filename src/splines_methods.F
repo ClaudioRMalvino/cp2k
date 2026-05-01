@@ -28,10 +28,12 @@ MODULE splines_methods
 
    PUBLIC :: init_splinexy ! allocates x and y vectors for splines
    PUBLIC :: init_spline ! generate table for spline (allocates y2)
+   PUBLIC :: init_hermite_spline ! init Hermite cubic spline (stores h*dydx in y2)
    PUBLIC :: potential_s ! return value of spline and 1. derivative
    ! without checks (fast routine for pair_potential)
    PUBLIC :: spline_value ! return value of spline and 1. derivative
    ! without check (without assumption of 1/x^2 grid)
+   PUBLIC :: hermite_spline_value ! evaluate Hermite cubic spline (and optionally its derivative)
 
 CONTAINS
 
@@ -240,5 +242,72 @@ CONTAINS
       IF (PRESENT(y1)) y1 = invh*((yhi - ylo) + &
                                   ((f13 - a*a)*y2lo - (f13 - b*b)*y2hi)*3.0_dp*h26)
    END FUNCTION spline_value
+
+! **************************************************************************************************
+!> \brief Initialise a Hermite cubic spline on a uniform grid.
+!>      Requires spl%y(1:n) filled with function values, spl%x1 set, and spl%n set
+!>      (e.g. via init_splinexy).  Stores h*dydx in spl%y2 so hermite_spline_value
+!>      needs no extra division per evaluation.
+!> \param spl  spline_data structure with y and n already populated
+!> \param dx   uniform grid spacing
+!> \param dydx first derivatives y'(x_i) at each of the n grid points
+! **************************************************************************************************
+   SUBROUTINE init_hermite_spline(spl, dx, dydx)
+
+      TYPE(spline_data_type), INTENT(INOUT)              :: spl
+      REAL(KIND=dp), INTENT(IN)                          :: dx
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: dydx
+
+      CPASSERT(SIZE(dydx) == spl%n)
+      spl%h    = dx
+      spl%invh = 1.0_dp/dx
+      spl%h26  = dx*dx/6.0_dp
+      spl%xn   = spl%x1 + REAL(spl%n - 1, KIND=dp)*dx
+      spl%y2(1:spl%n) = dx*dydx(1:spl%n)
+
+   END SUBROUTINE init_hermite_spline
+
+! **************************************************************************************************
+!> \brief Evaluate a Hermite cubic spline at xx, returning the interpolated value.
+!>      Optionally returns the first derivative y1 = d(val)/d(xx).
+!>      No out-of-range checks: caller must ensure xx in [spl%x1, spl%xn].
+!>      spl%y2 must hold the scaled tangents h*y'(x_i) as set by init_hermite_spline.
+!> \param spl  Hermite spline data
+!> \param xx   evaluation point
+!> \param y1   (OPTIONAL) first derivative at xx
+!> \return     interpolated function value
+! **************************************************************************************************
+   FUNCTION hermite_spline_value(spl, xx, y1) RESULT(val)
+
+      TYPE(spline_data_type), INTENT(IN)                 :: spl
+      REAL(KIND=dp), INTENT(IN)                          :: xx
+      REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: y1
+      REAL(KIND=dp)                                      :: val
+
+      INTEGER                                            :: i
+      REAL(KIND=dp)                                      :: t, t2, t3, ylo, yhi, m0, m1
+
+      i   = INT((xx - spl%x1)*spl%invh) + 1
+      i   = MAX(1, MIN(i, spl%n - 1))
+      t   = (xx - (spl%x1 + REAL(i - 1, KIND=dp)*spl%h))*spl%invh
+      t2  = t*t
+      t3  = t2*t
+      ylo = spl%y(i)
+      yhi = spl%y(i + 1)
+      m0  = spl%y2(i)       ! h * y'(x_i)
+      m1  = spl%y2(i + 1)   ! h * y'(x_{i+1})
+
+      val = (2.0_dp*t3 - 3.0_dp*t2 + 1.0_dp)*ylo + &
+            (t3 - 2.0_dp*t2 + t)*m0               + &
+            (-2.0_dp*t3 + 3.0_dp*t2)*yhi           + &
+            (t3 - t2)*m1
+
+      IF (PRESENT(y1)) &
+         y1 = spl%invh*((6.0_dp*t2 - 6.0_dp*t)*ylo         + &
+                        (3.0_dp*t2 - 4.0_dp*t + 1.0_dp)*m0 + &
+                        (-6.0_dp*t2 + 6.0_dp*t)*yhi         + &
+                        (3.0_dp*t2 - 2.0_dp*t)*m1)
+
+   END FUNCTION hermite_spline_value
 
 END MODULE splines_methods

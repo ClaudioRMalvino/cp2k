@@ -29,6 +29,10 @@ MODULE nnp_acsf
                                               nnp_neighbor_type,&
                                               nnp_type
    USE periodic_table,                  ONLY: get_ptable_info
+   USE splines_methods,                 ONLY: hermite_spline_value,&
+                                              init_hermite_spline,&
+                                              init_splinexy
+   USE splines_types,                   ONLY: spline_data_type
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -86,24 +90,11 @@ MODULE nnp_acsf
       INTEGER, ALLOCATABLE                 :: next(:)                     ! (n_images)
    END TYPE nnp_cell_list_cache_type
 
-! **************************************************************************************************
-!> \brief Module-level cache for Hermite Cubic Splines to replace expensive intrinsic functions.
-!>        Stores coefficients (a, b, c, d) for Horner's method evaluation.
-! **************************************************************************************************
-   TYPE, PRIVATE :: nnp_spline_cache_type
-      LOGICAL                                :: initialized = .FALSE.
-      INTEGER                                :: n_points = 5000
-      REAL(KIND=dp)                          :: dx_exp, inv_dx_exp, min_exp
-      REAL(KIND=dp)                          :: dx_cos, inv_dx_cos, min_cos, max_cos
-      REAL(KIND=dp)                          :: dx_tanh, inv_dx_tanh, min_tanh, max_tanh
-      
-      ! Dimension 1 is contiguous in memory (a, b, c, d). Dimension 2 is the grid index.
-      REAL(KIND=dp), ALLOCATABLE             :: coef_exp(:,:)
-      REAL(KIND=dp), ALLOCATABLE             :: coef_cos(:,:)
-      REAL(KIND=dp), ALLOCATABLE             :: coef_tanh(:,:)
-   END TYPE nnp_spline_cache_type
-
-   TYPE(nnp_spline_cache_type), SAVE, PRIVATE :: spline_cache
+   ! Module-level Hermite cubic splines built once at first call to nnp_init_acsf_groups.
+   ! spl_exp covers EXP on [-50, 0]; spl_cos covers COS on [0, pi]; spl_tanh covers TANH on [0, 1].
+   ! y2 stores h*y'(x_i) as required by hermite_spline_value (splines_methods.F).
+   TYPE(spline_data_type), SAVE, PRIVATE :: spl_exp, spl_cos, spl_tanh
+   LOGICAL, SAVE, PRIVATE                :: spline_initialized = .FALSE.
    TYPE(nnp_cell_list_cache_type), SAVE, PRIVATE :: cell_list_cache
 
    ! Persistent per-centre neighbour buffer, reused across all atoms in a force eval.
@@ -120,6 +111,11 @@ MODULE nnp_acsf
    REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_sym(:)
    REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_forcetmp(:,:)
    REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_force3tmp(:,:,:)
+   ! Pre-computed per-pair cutoff values and their dr-derivatives.
+   ! Hoists f_c(r1) and f_c(r2) out of the inner k-loop; fc3(r3) is still per-triplet.
+   INTEGER, SAVE, PRIVATE                          :: scratch_max_fc = -1
+   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_fc1(:), scratch_dfc1(:)
+   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_fc2(:), scratch_dfc2(:)
 
 CONTAINS
 
@@ -144,8 +140,8 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'nnp_calc_acsf'
 
       INTEGER                                            :: handle, handle_sf, ind, j, jj, k, kk, l, &
-                                                            m, off, s, sf
-      REAL(KIND=dp)                                      :: r1, r2, r3
+                                                            m, off, s, sf, fc_needed
+      REAL(KIND=dp)                                      :: r1, r2, r3, fc_tmp, dfc_tmp, tanh_v
       REAL(KIND=dp), DIMENSION(:), POINTER, CONTIGUOUS   :: symtmp
       REAL(KIND=dp), DIMENSION(:, :), POINTER, CONTIGUOUS :: forcetmp
       REAL(KIND=dp), DIMENSION(:, :, :), POINTER, CONTIGUOUS :: force3tmp
@@ -273,6 +269,48 @@ CONTAINS
             END IF
             symtmp => scratch_sym(1:nnp%ang(ind)%symfgrp(s)%n_symf)
             force3tmp => scratch_force3tmp(:,:, 1:nnp%ang(ind)%symfgrp(s)%n_symf)
+            ! Hoist f_c(r1) and f_c(r2) out of the k-loop: precompute for all neighbors in
+            ! ang1 (and ang2 for mixed-species) before entering the O(C^2) triple loop.
+            fc_needed = neighbor%n_ang1(s)
+            IF (nnp%ang(ind)%symfgrp(s)%ele(1) /= nnp%ang(ind)%symfgrp(s)%ele(2)) &
+               fc_needed = MAX(fc_needed, neighbor%n_ang2(s))
+            IF (scratch_max_fc < fc_needed) THEN
+               IF (ALLOCATED(scratch_fc1)) &
+                  DEALLOCATE(scratch_fc1, scratch_dfc1, scratch_fc2, scratch_dfc2)
+               ALLOCATE(scratch_fc1(fc_needed), scratch_dfc1(fc_needed))
+               ALLOCATE(scratch_fc2(fc_needed), scratch_dfc2(fc_needed))
+               scratch_max_fc = fc_needed
+            END IF
+            SELECT CASE (nnp%cut_type)
+            CASE (nnp_cut_cos)
+               DO j = 1, neighbor%n_ang1(s)
+                  fc_tmp = neighbor%dist_ang1(4, j, s)*nnp%ang(ind)%symfgrp(s)%pi_over_cut
+                  scratch_fc1(j) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp, y1=dfc_tmp) + 1.0_dp)
+                  scratch_dfc1(j) = 0.5_dp*dfc_tmp*nnp%ang(ind)%symfgrp(s)%pi_over_cut
+               END DO
+               IF (nnp%ang(ind)%symfgrp(s)%ele(1) /= nnp%ang(ind)%symfgrp(s)%ele(2)) THEN
+                  DO k = 1, neighbor%n_ang2(s)
+                     fc_tmp = neighbor%dist_ang2(4, k, s)*nnp%ang(ind)%symfgrp(s)%pi_over_cut
+                     scratch_fc2(k) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp, y1=dfc_tmp) + 1.0_dp)
+                     scratch_dfc2(k) = 0.5_dp*dfc_tmp*nnp%ang(ind)%symfgrp(s)%pi_over_cut
+                  END DO
+               END IF
+            CASE (nnp_cut_tanh)
+               DO j = 1, neighbor%n_ang1(s)
+                  fc_tmp = 1.0_dp - neighbor%dist_ang1(4, j, s)*nnp%ang(ind)%symfgrp(s)%inv_cut
+                  tanh_v = hermite_spline_value(spl_tanh, fc_tmp)
+                  scratch_fc1(j) = tanh_v**3
+                  scratch_dfc1(j) = (-3.0_dp*nnp%ang(ind)%symfgrp(s)%inv_cut)*(tanh_v**2 - tanh_v**4)
+               END DO
+               IF (nnp%ang(ind)%symfgrp(s)%ele(1) /= nnp%ang(ind)%symfgrp(s)%ele(2)) THEN
+                  DO k = 1, neighbor%n_ang2(s)
+                     fc_tmp = 1.0_dp - neighbor%dist_ang2(4, k, s)*nnp%ang(ind)%symfgrp(s)%inv_cut
+                     tanh_v = hermite_spline_value(spl_tanh, fc_tmp)
+                     scratch_fc2(k) = tanh_v**3
+                     scratch_dfc2(k) = (-3.0_dp*nnp%ang(ind)%symfgrp(s)%inv_cut)*(tanh_v**2 - tanh_v**4)
+                  END DO
+               END IF
+            END SELECT
             !loop over associated neighbors
             IF (nnp%ang(ind)%symfgrp(s)%ele(1) == nnp%ang(ind)%symfgrp(s)%ele(2)) THEN
                DO j = 1, neighbor%n_ang1(s)
@@ -287,7 +325,9 @@ CONTAINS
                         jj = neighbor%ind_ang1(j, s)
                         kk = neighbor%ind_ang1(k, s)
                         CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, &
-                                          r1, r2, r3, symtmp, force3tmp)
+                                          r1, r2, r3, symtmp, force3tmp, &
+                                          fc1_in=scratch_fc1(j), fc2_in=scratch_fc1(k), &
+                                          dfc1dr_in=scratch_dfc1(j), dfc2dr_in=scratch_dfc1(k))
                         DO sf = 1, nnp%ang(ind)%symfgrp(s)%n_symf
                            m = off + nnp%ang(ind)%symfgrp(s)%symf(sf)
                            ! update forces into dsymdxy
@@ -323,7 +363,9 @@ CONTAINS
                         jj = neighbor%ind_ang1(j, s)
                         kk = neighbor%ind_ang2(k, s)
                         CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, &
-                                          r1, r2, r3, symtmp, force3tmp)
+                                          r1, r2, r3, symtmp, force3tmp, &
+                                          fc1_in=scratch_fc1(j), fc2_in=scratch_fc2(k), &
+                                          dfc1dr_in=scratch_dfc1(j), dfc2dr_in=scratch_dfc2(k))
                         !loop over associated sym fncts
                         DO sf = 1, nnp%ang(ind)%symfgrp(s)%n_symf
                            m = off + nnp%ang(ind)%symfgrp(s)%symf(sf)
@@ -392,6 +434,41 @@ CONTAINS
                scratch_max_sym = SIZE(scratch_sym)
             END IF
             symtmp => scratch_sym(1:nnp%ang(ind)%symfgrp(s)%n_symf)
+            ! Hoist f_c(r1) and f_c(r2) out of the k-loop
+            fc_needed = neighbor%n_ang1(s)
+            IF (nnp%ang(ind)%symfgrp(s)%ele(1) /= nnp%ang(ind)%symfgrp(s)%ele(2)) &
+               fc_needed = MAX(fc_needed, neighbor%n_ang2(s))
+            IF (scratch_max_fc < fc_needed) THEN
+               IF (ALLOCATED(scratch_fc1)) &
+                  DEALLOCATE(scratch_fc1, scratch_dfc1, scratch_fc2, scratch_dfc2)
+               ALLOCATE(scratch_fc1(fc_needed), scratch_dfc1(fc_needed))
+               ALLOCATE(scratch_fc2(fc_needed), scratch_dfc2(fc_needed))
+               scratch_max_fc = fc_needed
+            END IF
+            SELECT CASE (nnp%cut_type)
+            CASE (nnp_cut_cos)
+               DO j = 1, neighbor%n_ang1(s)
+                  fc_tmp = neighbor%dist_ang1(4, j, s)*nnp%ang(ind)%symfgrp(s)%pi_over_cut
+                  scratch_fc1(j) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp) + 1.0_dp)
+               END DO
+               IF (nnp%ang(ind)%symfgrp(s)%ele(1) /= nnp%ang(ind)%symfgrp(s)%ele(2)) THEN
+                  DO k = 1, neighbor%n_ang2(s)
+                     fc_tmp = neighbor%dist_ang2(4, k, s)*nnp%ang(ind)%symfgrp(s)%pi_over_cut
+                     scratch_fc2(k) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp) + 1.0_dp)
+                  END DO
+               END IF
+            CASE (nnp_cut_tanh)
+               DO j = 1, neighbor%n_ang1(s)
+                  fc_tmp = 1.0_dp - neighbor%dist_ang1(4, j, s)*nnp%ang(ind)%symfgrp(s)%inv_cut
+                  scratch_fc1(j) = hermite_spline_value(spl_tanh, fc_tmp)**3
+               END DO
+               IF (nnp%ang(ind)%symfgrp(s)%ele(1) /= nnp%ang(ind)%symfgrp(s)%ele(2)) THEN
+                  DO k = 1, neighbor%n_ang2(s)
+                     fc_tmp = 1.0_dp - neighbor%dist_ang2(4, k, s)*nnp%ang(ind)%symfgrp(s)%inv_cut
+                     scratch_fc2(k) = hermite_spline_value(spl_tanh, fc_tmp)**3
+                  END DO
+               END IF
+            END SELECT
             !loop over associated neighbors
             IF (nnp%ang(ind)%symfgrp(s)%ele(1) == nnp%ang(ind)%symfgrp(s)%ele(2)) THEN
                DO j = 1, neighbor%n_ang1(s)
@@ -403,7 +480,8 @@ CONTAINS
                      rvect3 = rvect2 - rvect1
                      r3 = NORM2(rvect3(:))
                      IF (r3 < nnp%ang(ind)%symfgrp(s)%cutoff) THEN
-                        CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, r1, r2, r3, symtmp)
+                        CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, r1, r2, r3, symtmp, &
+                                          fc1_in=scratch_fc1(j), fc2_in=scratch_fc1(k))
                         DO sf = 1, nnp%ang(ind)%symfgrp(s)%n_symf
                            m = off + nnp%ang(ind)%symfgrp(s)%symf(sf)
                            nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + symtmp(sf)
@@ -421,7 +499,8 @@ CONTAINS
                      rvect3 = rvect2 - rvect1
                      r3 = NORM2(rvect3(:))
                      IF (r3 < nnp%ang(ind)%symfgrp(s)%cutoff) THEN
-                        CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, r1, r2, r3, symtmp)
+                        CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, r1, r2, r3, symtmp, &
+                                          fc1_in=scratch_fc1(j), fc2_in=scratch_fc2(k))
                         !loop over associated sym fncts
                         DO sf = 1, nnp%ang(ind)%symfgrp(s)%n_symf
                            m = off + nnp%ang(ind)%symfgrp(s)%symf(sf)
@@ -725,9 +804,9 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT), &
          OPTIONAL                                        :: force
 
-      INTEGER                                            :: k, sf, idx
+      INTEGER                                            :: k, sf
       REAL(KIND=dp)                                      :: dfcutdr, dsymdr, eta, fcut, funccut, rs, &
-                                                            tmp, t, cos_val, dcos_dx, tanh_val, rinv
+                                                            tmp, dcos_dx, tanh_val, rinv
       REAL(KIND=dp), DIMENSION(3)                        :: drdx
 
       !init
@@ -740,38 +819,19 @@ CONTAINS
       SELECT CASE (nnp%cut_type)
       CASE (nnp_cut_cos)
          tmp = r * nnp%rad(ind)%symfgrp(s)%pi_over_cut
-         
-         idx = INT((tmp - spline_cache%min_cos) * spline_cache%inv_dx_cos) + 1
-         IF (idx < 1) idx = 1
-         IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
-         t = tmp - (spline_cache%min_cos + REAL(idx - 1, dp) * spline_cache%dx_cos)
-         
-         cos_val = spline_cache%coef_cos(1, idx) + t * (spline_cache%coef_cos(2, idx) + &
-                   t * (spline_cache%coef_cos(3, idx) + t * spline_cache%coef_cos(4, idx)))
-         
-         fcut = 0.5_dp*(cos_val + 1.0_dp)
-         
          IF (PRESENT(force)) THEN
-            dcos_dx = spline_cache%coef_cos(2, idx) + t * (2.0_dp * spline_cache%coef_cos(3, idx) + &
-                      t * 3.0_dp * spline_cache%coef_cos(4, idx))
-            dfcutdr = 0.5_dp*(dcos_dx)*(pi/funccut)
+            fcut = 0.5_dp*(hermite_spline_value(spl_cos, tmp, y1=dcos_dx) + 1.0_dp)
+            dfcutdr = 0.5_dp*dcos_dx*(pi/funccut)
+         ELSE
+            fcut = 0.5_dp*(hermite_spline_value(spl_cos, tmp) + 1.0_dp)
          END IF
 
       CASE (nnp_cut_tanh)
          tmp = 1.0_dp - r * nnp%rad(ind)%symfgrp(s)%inv_cut
-         
-         idx = INT((tmp - spline_cache%min_tanh) * spline_cache%inv_dx_tanh) + 1
-         IF (idx < 1) idx = 1
-         IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
-         t = tmp - (spline_cache%min_tanh + REAL(idx - 1, dp) * spline_cache%dx_tanh)
-         
-         tanh_val = spline_cache%coef_tanh(1, idx) + t * (spline_cache%coef_tanh(2, idx) + &
-                    t * (spline_cache%coef_tanh(3, idx) + t * spline_cache%coef_tanh(4, idx)))
-         
+         tanh_val = hermite_spline_value(spl_tanh, tmp)
          fcut = tanh_val**3
-         IF (PRESENT(force)) THEN
+         IF (PRESENT(force)) &
             dfcutdr = (-3.0_dp/funccut)*(tanh_val**2 - tanh_val**4)
-         END IF
 
       CASE DEFAULT
          CPABORT("NNP| Cutoff function unknown")
@@ -793,25 +853,15 @@ CONTAINS
 
          tmp = -eta*(r - rs)**2
 
-         ! Fast Spline Evaluation for EXP(tmp).  We use sym(sf) (the spline value, ~EXP(tmp))
-         ! directly in the chain rule instead of evaluating the spline derivative — the
-         ! Hermite cubic value has O(h^4) error vs O(h^3) for its formal derivative, so this
-         ! is both faster (skip 4 mul + 2 add) and slightly more accurate.
-         IF (tmp <= spline_cache%min_exp) THEN
+         ! Use spline value directly in the EXP chain rule (O(h^4) accuracy vs O(h^3) derivative).
+         IF (tmp <= spl_exp%x1) THEN
             sym(sf) = 0.0_dp
             IF (PRESENT(force)) dsymdr = 0.0_dp
          ELSE IF (tmp >= 0.0_dp) THEN
             sym(sf) = 1.0_dp
             IF (PRESENT(force)) dsymdr = 0.0_dp
          ELSE
-            idx = INT((tmp - spline_cache%min_exp)*spline_cache%inv_dx_exp) + 1
-            IF (idx < 1) idx = 1
-            IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
-            t = tmp - (spline_cache%min_exp + REAL(idx - 1, dp)*spline_cache%dx_exp)
-
-            sym(sf) = spline_cache%coef_exp(1, idx) + t*(spline_cache%coef_exp(2, idx) + &
-                      t*(spline_cache%coef_exp(3, idx) + t*spline_cache%coef_exp(4, idx)))
-
+            sym(sf) = hermite_spline_value(spl_exp, tmp)
             IF (PRESENT(force)) dsymdr = sym(sf)*(-2.0_dp*eta*(r - rs))
          END IF
 
@@ -841,7 +891,8 @@ CONTAINS
 !> \date   2020-10-10
 !> \author Christoph Schran (christoph.schran@rub.de)
 ! **************************************************************************************************
-   SUBROUTINE nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, r1, r2, r3, sym, force)
+   SUBROUTINE nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, r1, r2, r3, sym, force, &
+                            fc1_in, fc2_in, dfc1dr_in, dfc2dr_in)
 
       TYPE(nnp_type), INTENT(IN)                         :: nnp
       INTEGER, INTENT(IN)                                :: ind, s
@@ -850,11 +901,13 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: sym
       REAL(KIND=dp), DIMENSION(:, :, :), INTENT(OUT), &
          OPTIONAL                                        :: force
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: fc1_in, fc2_in
+      REAL(KIND=dp), INTENT(IN), OPTIONAL                :: dfc1dr_in, dfc2dr_in
 
-      INTEGER                                            :: i, m, sf, idx
+      INTEGER                                            :: i, m, sf
       REAL(KIND=dp) :: angular, costheta, dfcutdr1, dfcutdr2, dfcutdr3, dsymdr1, dsymdr2, dsymdr3, &
          eta, f, fcut, fcut1, fcut2, fcut3, ftot, g, g_sq_inv, lam, pref, prefzeta, rsqr1, rsqr2, &
-         rsqr3, r_sum_sq, r1inv, r2inv, r3inv, symtmp, tmp, tmp1, tmp2, tmp3, tmpzeta, zeta, t
+         rsqr3, r_sum_sq, r1inv, r2inv, r3inv, symtmp, tmp, tmp1, tmp2, tmp3, tmpzeta, zeta
       REAL(KIND=dp) :: dcos_dx1, dcos_dx2, dcos_dx3
       REAL(KIND=dp) :: tanh_val1, tanh_val2, tanh_val3
       REAL(KIND=dp), DIMENSION(3) :: dangulardx1, dangulardx2, dangulardx3, dcosthetadx1, &
@@ -885,71 +938,65 @@ CONTAINS
       fcut = nnp%ang(ind)%symfgrp(s)%cutoff !cutoff
       SELECT CASE (nnp%cut_type)
       CASE (nnp_cut_cos)
-         tmp1 = r1 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
-         idx = INT((tmp1 - spline_cache%min_cos) * spline_cache%inv_dx_cos) + 1
-         IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
-         t = tmp1 - (spline_cache%min_cos + REAL(idx - 1, dp) * spline_cache%dx_cos)
-         fcut1 = 0.5_dp * (spline_cache%coef_cos(1, idx) + t * (spline_cache%coef_cos(2, idx) + &
-                 t * (spline_cache%coef_cos(3, idx) + t * spline_cache%coef_cos(4, idx))) + 1.0_dp)
-         IF (PRESENT(force)) dcos_dx1 = spline_cache%coef_cos(2, idx) + & 
-         t * (2.0_dp * spline_cache%coef_cos(3, idx) + t * 3.0_dp * spline_cache%coef_cos(4, idx))
-
-         tmp2 = r2 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
-         idx = INT((tmp2 - spline_cache%min_cos) * spline_cache%inv_dx_cos) + 1
-         IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
-         t = tmp2 - (spline_cache%min_cos + REAL(idx - 1, dp) * spline_cache%dx_cos)
-         fcut2 = 0.5_dp * (spline_cache%coef_cos(1, idx) + t * (spline_cache%coef_cos(2, idx) + &
-                 t * (spline_cache%coef_cos(3, idx) + t * spline_cache%coef_cos(4, idx))) + 1.0_dp)
-         IF (PRESENT(force)) dcos_dx2 = spline_cache%coef_cos(2, idx) + &
-               t * (2.0_dp * spline_cache%coef_cos(3, idx) + t * 3.0_dp * spline_cache%coef_cos(4, idx))
-
          tmp3 = r3 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
-         idx = INT((tmp3 - spline_cache%min_cos) * spline_cache%inv_dx_cos) + 1
-         IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
-         t = tmp3 - (spline_cache%min_cos + REAL(idx - 1, dp) * spline_cache%dx_cos)
-         fcut3 = 0.5_dp * (spline_cache%coef_cos(1, idx) + t * (spline_cache%coef_cos(2, idx) + &
-                 t * (spline_cache%coef_cos(3, idx) + t * spline_cache%coef_cos(4, idx))) + 1.0_dp)
-         IF (PRESENT(force)) dcos_dx3 = spline_cache%coef_cos(2, idx) + &
-                  t * (2.0_dp * spline_cache%coef_cos(3, idx) + t * 3.0_dp * spline_cache%coef_cos(4, idx))
-
+         IF (PRESENT(force)) THEN
+            fcut3 = 0.5_dp*(hermite_spline_value(spl_cos, tmp3, y1=dcos_dx3) + 1.0_dp)
+            IF (PRESENT(fc1_in)) THEN
+               fcut1 = fc1_in;  fcut2 = fc2_in
+            ELSE
+               tmp1 = r1 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
+               tmp2 = r2 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
+               fcut1 = 0.5_dp*(hermite_spline_value(spl_cos, tmp1, y1=dcos_dx1) + 1.0_dp)
+               fcut2 = 0.5_dp*(hermite_spline_value(spl_cos, tmp2, y1=dcos_dx2) + 1.0_dp)
+            END IF
+         ELSE
+            fcut3 = 0.5_dp*(hermite_spline_value(spl_cos, tmp3) + 1.0_dp)
+            IF (PRESENT(fc1_in)) THEN
+               fcut1 = fc1_in;  fcut2 = fc2_in
+            ELSE
+               tmp1 = r1 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
+               tmp2 = r2 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
+               fcut1 = 0.5_dp*(hermite_spline_value(spl_cos, tmp1) + 1.0_dp)
+               fcut2 = 0.5_dp*(hermite_spline_value(spl_cos, tmp2) + 1.0_dp)
+            END IF
+         END IF
          ftot = fcut1*fcut2*fcut3
          IF (PRESENT(force)) THEN
             pref = 0.5_dp*(pi/fcut)
-            dfcutdr1 = pref*(dcos_dx1)*fcut2*fcut3
-            dfcutdr2 = pref*(dcos_dx2)*fcut1*fcut3
-            dfcutdr3 = pref*(dcos_dx3)*fcut1*fcut2
+            IF (PRESENT(fc1_in)) THEN
+               dfcutdr1 = dfc1dr_in*fcut2*fcut3
+               dfcutdr2 = dfc2dr_in*fcut1*fcut3
+            ELSE
+               dfcutdr1 = pref*dcos_dx1*fcut2*fcut3
+               dfcutdr2 = pref*dcos_dx2*fcut1*fcut3
+            END IF
+            dfcutdr3 = pref*dcos_dx3*fcut1*fcut2
          END IF
 
       CASE (nnp_cut_tanh)
-         tmp1 = 1.0_dp - r1 * nnp%ang(ind)%symfgrp(s)%inv_cut
-         idx = INT((tmp1 - spline_cache%min_tanh) * spline_cache%inv_dx_tanh) + 1
-         IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
-         t = tmp1 - (spline_cache%min_tanh + REAL(idx - 1, dp) * spline_cache%dx_tanh)
-         tanh_val1 = spline_cache%coef_tanh(1, idx) + t * (spline_cache%coef_tanh(2, idx) + &
-                     t * (spline_cache%coef_tanh(3, idx) + t * spline_cache%coef_tanh(4, idx)))
-         fcut1 = tanh_val1**3
-
-         tmp2 = 1.0_dp - r2 * nnp%ang(ind)%symfgrp(s)%inv_cut
-         idx = INT((tmp2 - spline_cache%min_tanh) * spline_cache%inv_dx_tanh) + 1
-         IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
-         t = tmp2 - (spline_cache%min_tanh + REAL(idx - 1, dp) * spline_cache%dx_tanh)
-         tanh_val2 = spline_cache%coef_tanh(1, idx) + t * (spline_cache%coef_tanh(2, idx) + &
-                     t * (spline_cache%coef_tanh(3, idx) + t * spline_cache%coef_tanh(4, idx)))
-         fcut2 = tanh_val2**3
-
          tmp3 = 1.0_dp - r3 * nnp%ang(ind)%symfgrp(s)%inv_cut
-         idx = INT((tmp3 - spline_cache%min_tanh) * spline_cache%inv_dx_tanh) + 1
-         IF (idx < 1) idx = 1; IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
-         t = tmp3 - (spline_cache%min_tanh + REAL(idx - 1, dp) * spline_cache%dx_tanh)
-         tanh_val3 = spline_cache%coef_tanh(1, idx) + t * (spline_cache%coef_tanh(2, idx) + &
-                     t * (spline_cache%coef_tanh(3, idx) + t * spline_cache%coef_tanh(4, idx)))
+         tanh_val3 = hermite_spline_value(spl_tanh, tmp3)
          fcut3 = tanh_val3**3
-
+         IF (PRESENT(fc1_in)) THEN
+            fcut1 = fc1_in;  fcut2 = fc2_in
+         ELSE
+            tmp1 = 1.0_dp - r1 * nnp%ang(ind)%symfgrp(s)%inv_cut
+            tmp2 = 1.0_dp - r2 * nnp%ang(ind)%symfgrp(s)%inv_cut
+            tanh_val1 = hermite_spline_value(spl_tanh, tmp1)
+            tanh_val2 = hermite_spline_value(spl_tanh, tmp2)
+            fcut1 = tanh_val1**3
+            fcut2 = tanh_val2**3
+         END IF
          ftot = fcut1*fcut2*fcut3
          IF (PRESENT(force)) THEN
             pref = -3.0_dp/fcut
-            dfcutdr1 = pref*(tanh_val1**2 - tanh_val1**4)*fcut2*fcut3
-            dfcutdr2 = pref*(tanh_val2**2 - tanh_val2**4)*fcut1*fcut3
+            IF (PRESENT(fc1_in)) THEN
+               dfcutdr1 = dfc1dr_in*fcut2*fcut3
+               dfcutdr2 = dfc2dr_in*fcut1*fcut3
+            ELSE
+               dfcutdr1 = pref*(tanh_val1**2 - tanh_val1**4)*fcut2*fcut3
+               dfcutdr2 = pref*(tanh_val2**2 - tanh_val2**4)*fcut1*fcut3
+            END IF
             dfcutdr3 = pref*(tanh_val3**2 - tanh_val3**4)*fcut1*fcut2
          END IF
 
@@ -1002,18 +1049,12 @@ CONTAINS
          ! instead of evaluating the spline derivative separately — same answer, slightly
          ! more accurate (O(h^4) value vs O(h^3) formal derivative).
          tmp = -eta*r_sum_sq
-         IF (tmp <= spline_cache%min_exp) THEN
+         IF (tmp <= spl_exp%x1) THEN
             symtmp = 0.0_dp
          ELSE IF (tmp >= 0.0_dp) THEN
             symtmp = 1.0_dp
          ELSE
-            idx = INT((tmp - spline_cache%min_exp)*spline_cache%inv_dx_exp) + 1
-            IF (idx < 1) idx = 1
-            IF (idx > spline_cache%n_points - 1) idx = spline_cache%n_points - 1
-            t = tmp - (spline_cache%min_exp + REAL(idx - 1, dp)*spline_cache%dx_exp)
-
-            symtmp = spline_cache%coef_exp(1, idx) + t*(spline_cache%coef_exp(2, idx) + &
-                     t*(spline_cache%coef_exp(3, idx) + t*spline_cache%coef_exp(4, idx)))
+            symtmp = hermite_spline_value(spl_exp, tmp)
          END IF
 
          IF (PRESENT(force)) THEN
@@ -1374,10 +1415,8 @@ CONTAINS
 
       INTEGER                                            :: ang, i, j, k, rad, s, zint
       INTEGER                                            :: col, pos
-      REAL(KIND=dp)                                      :: funccut
-
-      ! Variables for inline Spline Initialization
-      REAL(KIND=dp)                                      :: x0, x1, y0, y1, m0, m1, h
+      REAL(KIND=dp)                                      :: funccut, h_spl, x_j
+      REAL(KIND=dp), ALLOCATABLE                         :: dydx(:)
 
       ! Precompute integer-zeta companions (NINT and is-integer flag) once.  Sort has already
       ! finalised the order of zeta(:) by the time this routine runs, so a single pass suffices.
@@ -1570,72 +1609,48 @@ CONTAINS
       END DO
 
       ! -------------------------------------------------------------------------
-      ! Inline Hermite Spline Initialization
+      ! Hermite Spline Initialisation via splines_methods infrastructure
       ! -------------------------------------------------------------------------
-      IF (.NOT. spline_cache%initialized) THEN
-         ! Setup EXP spline
-         spline_cache%min_exp = -50.0_dp
-         spline_cache%dx_exp = ABS(spline_cache%min_exp) / REAL(spline_cache%n_points - 1, dp)
-         spline_cache%inv_dx_exp = 1.0_dp / spline_cache%dx_exp
-         ALLOCATE(spline_cache%coef_exp(4, spline_cache%n_points - 1))
+      IF (.NOT. spline_initialized) THEN
+         ALLOCATE(dydx(5000))
 
-         h = spline_cache%dx_exp
-         DO i = 1, spline_cache%n_points - 1
-            x0 = spline_cache%min_exp + REAL(i - 1, dp) * h
-            x1 = x0 + h
-            y0 = EXP(x0); m0 = EXP(x0)
-            y1 = EXP(x1); m1 = EXP(x1)
-            spline_cache%coef_exp(1, i) = y0
-            spline_cache%coef_exp(2, i) = m0
-            spline_cache%coef_exp(3, i) = (3.0_dp*(y1 - y0) / (h*h)) - ((2.0_dp*m0 + m1) / h)
-            spline_cache%coef_exp(4, i) = (2.0_dp*(y0 - y1) / (h*h*h)) + ((m0 + m1) / (h*h))
+         ! EXP spline on [-50, 0]: d/dx[exp(x)] = exp(x)
+         CALL init_splinexy(spl_exp, 5000)
+         spl_exp%x1 = -50.0_dp
+         h_spl = 50.0_dp/REAL(4999, KIND=dp)
+         DO i = 1, 5000
+            x_j = -50.0_dp + REAL(i - 1, KIND=dp)*h_spl
+            spl_exp%y(i) = EXP(x_j)
+            dydx(i) = spl_exp%y(i)
          END DO
+         CALL init_hermite_spline(spl_exp, h_spl, dydx)
 
-         ! Setup COS spline.  Cutoff usage is f_c(x) = 0.5*(cos(pi*x) + 1) for x = r/cutoff in
-         ! [0, 1), so the spline argument tmp = pi*r/cutoff lives in [0, pi] only.  Using [0, pi]
-         ! instead of [-pi, pi] doubles the resolution at the same n_points (~16x improvement
-         ! in pointwise Hermite-cubic error, since error scales as h^4).
-         spline_cache%min_cos = 0.0_dp
-         spline_cache%max_cos = acos(-1.0_dp)
-         spline_cache%dx_cos = (spline_cache%max_cos - spline_cache%min_cos) / REAL(spline_cache%n_points - 1, dp)
-         spline_cache%inv_dx_cos = 1.0_dp / spline_cache%dx_cos
-         ALLOCATE(spline_cache%coef_cos(4, spline_cache%n_points - 1))
-
-         h = spline_cache%dx_cos
-         DO i = 1, spline_cache%n_points - 1
-            x0 = spline_cache%min_cos + REAL(i - 1, dp) * h
-            x1 = x0 + h
-            y0 = COS(x0); m0 = -SIN(x0)
-            y1 = COS(x1); m1 = -SIN(x1)
-            spline_cache%coef_cos(1, i) = y0
-            spline_cache%coef_cos(2, i) = m0
-            spline_cache%coef_cos(3, i) = (3.0_dp*(y1 - y0) / (h*h)) - ((2.0_dp*m0 + m1) / h)
-            spline_cache%coef_cos(4, i) = (2.0_dp*(y0 - y1) / (h*h*h)) + ((m0 + m1) / (h*h))
+         ! COS spline on [0, pi]: d/dx[cos(x)] = -sin(x)
+         ! Argument is pi*r/cutoff in [0, pi) so this domain covers all physical inputs.
+         CALL init_splinexy(spl_cos, 5000)
+         spl_cos%x1 = 0.0_dp
+         h_spl = pi/REAL(4999, KIND=dp)
+         DO i = 1, 5000
+            x_j = REAL(i - 1, KIND=dp)*h_spl
+            spl_cos%y(i) = COS(x_j)
+            dydx(i) = -SIN(x_j)
          END DO
+         CALL init_hermite_spline(spl_cos, h_spl, dydx)
 
-         ! Setup TANH spline.  Cutoff usage is f_c(x) = tanh^3(1 - x) for x = r/cutoff in [0, 1),
-         ! so the spline argument tmp = 1 - r/cutoff lives in [0, 1] only.  Using [0, 1] instead
-         ! of [-10, 10] gives ~20x finer resolution at the same n_points (~1.6e5 improvement in
-         ! pointwise error, way past what the regtest tolerance demands).
-         spline_cache%min_tanh = 0.0_dp
-         spline_cache%max_tanh = 1.0_dp
-         spline_cache%dx_tanh = (spline_cache%max_tanh - spline_cache%min_tanh) / REAL(spline_cache%n_points - 1, dp)
-         spline_cache%inv_dx_tanh = 1.0_dp / spline_cache%dx_tanh
-         ALLOCATE(spline_cache%coef_tanh(4, spline_cache%n_points - 1))
-
-         h = spline_cache%dx_tanh
-         DO i = 1, spline_cache%n_points - 1
-            x0 = spline_cache%min_tanh + REAL(i - 1, dp) * h
-            x1 = x0 + h
-            y0 = TANH(x0); m0 = 1.0_dp - y0*y0
-            y1 = TANH(x1); m1 = 1.0_dp - y1*y1
-            spline_cache%coef_tanh(1, i) = y0
-            spline_cache%coef_tanh(2, i) = m0
-            spline_cache%coef_tanh(3, i) = (3.0_dp*(y1 - y0) / (h*h)) - ((2.0_dp*m0 + m1) / h)
-            spline_cache%coef_tanh(4, i) = (2.0_dp*(y0 - y1) / (h*h*h)) + ((m0 + m1) / (h*h))
+         ! TANH spline on [0, 1]: d/dx[tanh(x)] = 1 - tanh^2(x)
+         ! Argument is 1 - r/cutoff in (0, 1] so this domain covers all physical inputs.
+         CALL init_splinexy(spl_tanh, 5000)
+         spl_tanh%x1 = 0.0_dp
+         h_spl = 1.0_dp/REAL(4999, KIND=dp)
+         DO i = 1, 5000
+            x_j = REAL(i - 1, KIND=dp)*h_spl
+            spl_tanh%y(i) = TANH(x_j)
+            dydx(i) = 1.0_dp - spl_tanh%y(i)**2
          END DO
-         
-         spline_cache%initialized = .TRUE.
+         CALL init_hermite_spline(spl_tanh, h_spl, dydx)
+
+         DEALLOCATE(dydx)
+         spline_initialized = .TRUE.
       END IF
 
    END SUBROUTINE nnp_init_acsf_groups
