@@ -158,7 +158,7 @@ CONTAINS
                DEALLOCATE (dsymdxyz, active_atoms, active_flag, denergydsym)
                IF (ALLOCATED(stress)) DEALLOCATE (stress)
             END IF
-            ALLOCATE (dsymdxyz(3, max_nsym, nnp%num_atoms), SOURCE=0.0_dp)
+            ALLOCATE (dsymdxyz(max_nsym, 3, nnp%num_atoms), SOURCE=0.0_dp)
             ALLOCATE (active_atoms(nnp%num_atoms))
             ALLOCATE (active_flag(nnp%num_atoms), SOURCE=0)
             ALLOCATE (denergydsym(max_nsym))
@@ -212,10 +212,10 @@ CONTAINS
                END IF
                DO idx = 1, n_active
                   k = active_atoms(idx)
-                  DO j = 1, nnp%arc(ind)%n_nodes(1)
-                     DO m = 1, 3
-                        nnp%myforce(m, k, i_com) = nnp%myforce(m, k, i_com) - denergydsym(j)*dsymdxyz(m, j, k)
-                     END DO
+                  DO m = 1, 3
+                     nnp%myforce(m, k, i_com) = nnp%myforce(m, k, i_com) - &
+                        DOT_PRODUCT(denergydsym(1:nnp%arc(ind)%n_nodes(1)), &
+                                    dsymdxyz(1:nnp%arc(ind)%n_nodes(1), m, k))
                   END DO
                END DO
             END IF
@@ -226,7 +226,7 @@ CONTAINS
          IF (calc_forces) THEN
             DO idx = 1, n_active
                k = active_atoms(idx)
-               dsymdxyz(:, 1:nnp%arc(ind)%n_nodes(1), k) = 0.0_dp
+               dsymdxyz(1:nnp%arc(ind)%n_nodes(1), :, k) = 0.0_dp
                active_flag(k) = 0
             END DO
          END IF

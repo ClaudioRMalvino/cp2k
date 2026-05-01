@@ -239,8 +239,8 @@ CONTAINS
                   m = nnp%rad(ind)%symfgrp(s)%symf(sf)
                   ! update forces into dsymdxyz
                   DO l = 1, 3
-                     dsymdxyz(l, m, i) = dsymdxyz(l, m, i) + forcetmp(l, sf)
-                     dsymdxyz(l, m, jj) = dsymdxyz(l, m, jj) - forcetmp(l, sf)
+                     dsymdxyz(m, l, i) = dsymdxyz(m, l, i) + forcetmp(l, sf)
+                     dsymdxyz(m, l, jj) = dsymdxyz(m, l, jj) - forcetmp(l, sf)
                   END DO
                   IF (PRESENT(stress)) THEN
                      DO l = 1, 3
@@ -292,11 +292,11 @@ CONTAINS
                            m = off + nnp%ang(ind)%symfgrp(s)%symf(sf)
                            ! update forces into dsymdxy
                            DO l = 1, 3
-                              dsymdxyz(l, m, i) = dsymdxyz(l, m, i) &
+                              dsymdxyz(m, l, i) = dsymdxyz(m, l, i) &
                                                   + force3tmp(l, 1, sf)
-                              dsymdxyz(l, m, jj) = dsymdxyz(l, m, jj) &
+                              dsymdxyz(m, l, jj) = dsymdxyz(m, l, jj) &
                                                    + force3tmp(l, 2, sf)
-                              dsymdxyz(l, m, kk) = dsymdxyz(l, m, kk) &
+                              dsymdxyz(m, l, kk) = dsymdxyz(m, l, kk) &
                                                    + force3tmp(l, 3, sf)
                            END DO
                            IF (PRESENT(stress)) THEN
@@ -329,11 +329,11 @@ CONTAINS
                            m = off + nnp%ang(ind)%symfgrp(s)%symf(sf)
                            ! update forces into dsymdxy
                            DO l = 1, 3
-                              dsymdxyz(l, m, i) = dsymdxyz(l, m, i) &
+                              dsymdxyz(m, l, i) = dsymdxyz(m, l, i) &
                                                   + force3tmp(l, 1, sf)
-                              dsymdxyz(l, m, jj) = dsymdxyz(l, m, jj) &
+                              dsymdxyz(m, l, jj) = dsymdxyz(m, l, jj) &
                                                    + force3tmp(l, 2, sf)
-                              dsymdxyz(l, m, kk) = dsymdxyz(l, m, kk) &
+                              dsymdxyz(m, l, kk) = dsymdxyz(m, l, kk) &
                                                    + force3tmp(l, 3, sf)
                            END DO
                            IF (PRESENT(stress)) THEN
@@ -596,7 +596,7 @@ CONTAINS
                DO idx = 1, n_active
                   k = active_atoms(idx)
                   DO j = 1, nnp%n_rad(ind)
-                     dsymdxyz(:, j, k) = dsymdxyz(:, j, k)/ &
+                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)/ &
                                          (nnp%rad(ind)%loc_max(j) - &
                                           nnp%rad(ind)%loc_min(j))* &
                                          (nnp%scmax - nnp%scmin)
@@ -606,7 +606,7 @@ CONTAINS
                DO idx = 1, n_active
                   k = active_atoms(idx)
                   DO j = 1, nnp%n_ang(ind)
-                     dsymdxyz(:, j + off, k) = dsymdxyz(:, j + off, k)/ &
+                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)/ &
                                                (nnp%ang(ind)%loc_max(j) - &
                                                 nnp%ang(ind)%loc_min(j))* &
                                                (nnp%scmax - nnp%scmin)
@@ -615,7 +615,7 @@ CONTAINS
             ELSE
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_rad(ind)
-                     dsymdxyz(:, j, k) = dsymdxyz(:, j, k)/ &
+                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)/ &
                                          (nnp%rad(ind)%loc_max(j) - &
                                           nnp%rad(ind)%loc_min(j))* &
                                          (nnp%scmax - nnp%scmin)
@@ -624,7 +624,7 @@ CONTAINS
                off = nnp%n_rad(ind)
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_ang(ind)
-                     dsymdxyz(:, j + off, k) = dsymdxyz(:, j + off, k)/ &
+                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)/ &
                                                (nnp%ang(ind)%loc_max(j) - &
                                                 nnp%ang(ind)%loc_min(j))* &
                                                (nnp%scmax - nnp%scmin)
@@ -636,7 +636,7 @@ CONTAINS
                DO idx = 1, n_active
                   k = active_atoms(idx)
                   DO j = 1, nnp%n_rad(ind)
-                     dsymdxyz(:, j, k) = dsymdxyz(:, j, k)/ &
+                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)/ &
                                          nnp%rad(ind)%sigma(j)* &
                                          (nnp%scmax - nnp%scmin)
                   END DO
@@ -645,7 +645,7 @@ CONTAINS
                DO idx = 1, n_active
                   k = active_atoms(idx)
                   DO j = 1, nnp%n_ang(ind)
-                     dsymdxyz(:, j + off, k) = dsymdxyz(:, j + off, k)/ &
+                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)/ &
                                                nnp%ang(ind)%sigma(j)* &
                                                (nnp%scmax - nnp%scmin)
                   END DO
@@ -653,7 +653,7 @@ CONTAINS
             ELSE
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_rad(ind)
-                     dsymdxyz(:, j, k) = dsymdxyz(:, j, k)/ &
+                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)/ &
                                          nnp%rad(ind)%sigma(j)* &
                                          (nnp%scmax - nnp%scmin)
                   END DO
@@ -661,7 +661,7 @@ CONTAINS
                off = nnp%n_rad(ind)
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_ang(ind)
-                     dsymdxyz(:, j + off, k) = dsymdxyz(:, j + off, k)/ &
+                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)/ &
                                                nnp%ang(ind)%sigma(j)* &
                                                (nnp%scmax - nnp%scmin)
                   END DO
