@@ -113,9 +113,12 @@ MODULE nnp_acsf
    REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_force3tmp(:,:,:)
    ! Pre-computed per-pair cutoff values and their dr-derivatives.
    ! Hoists f_c(r1) and f_c(r2) out of the inner k-loop; fc3(r3) is still per-triplet.
+   ! scratch_dr1dx / scratch_dr2dx hold rvect/r unit vectors per neighbour, also k-loop invariant.
    INTEGER, SAVE, PRIVATE                          :: scratch_max_fc = -1
    REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_fc1(:), scratch_dfc1(:)
    REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_fc2(:), scratch_dfc2(:)
+   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_dr1dx(:, :)  ! (3, n)
+   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_dr2dx(:, :)  ! (3, n)
 
 CONTAINS
 
@@ -140,8 +143,9 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'nnp_calc_acsf'
 
       INTEGER                                            :: handle, handle_sf, ind, j, jj, k, kk, l, &
-                                                            m, off, s, sf, fc_needed
-      REAL(KIND=dp)                                      :: r1, r2, r3, fc_tmp, dfc_tmp, tanh_v
+                                                            m, off, s, sf, fc_needed, cut_type
+      REAL(KIND=dp)                                      :: r1, r2, r3, r3sq, r1inv, r2inv, &
+                                                            fc_tmp, dfc_tmp, tanh_v
       REAL(KIND=dp), DIMENSION(:), POINTER, CONTIGUOUS   :: symtmp
       REAL(KIND=dp), DIMENSION(:, :), POINTER, CONTIGUOUS :: forcetmp
       REAL(KIND=dp), DIMENSION(:, :, :), POINTER, CONTIGUOUS :: force3tmp
@@ -152,6 +156,10 @@ CONTAINS
 
       !determine index of atom type
       ind = nnp%ele_ind(i)
+
+      ! Hoist invariants: cut_type is set once at init and never changes.  The compiler can't
+      ! prove this through the derived-type access on every loop iteration, so cache locally.
+      cut_type = nnp%cut_type
 
       ! Reuse the module-level persistent neighbour buffer (sized once per force eval by
       ! nnp_neighbor_ensure_persistent).  Only the counts are reset between centre atoms;
@@ -223,16 +231,17 @@ CONTAINS
                ALLOCATE(scratch_force3tmp(3,3,nnp%rad(ind)%symfgrp(s)%n_symf))
                scratch_max_sym = SIZE(scratch_sym)
             END IF
-            symtmp => scratch_sym(1:nnp%rad(ind)%symfgrp(s)%n_symf)
-            forcetmp => scratch_forcetmp(:, 1:nnp%rad(ind)%symfgrp(s)%n_symf)
+            ASSOCIATE (sg => nnp%rad(ind)%symfgrp(s))
+            symtmp => scratch_sym(1:sg%n_symf)
+            forcetmp => scratch_forcetmp(:, 1:sg%n_symf)
             !loop over associated neighbors
             DO j = 1, neighbor%n_rad(s)
                rvect1 = neighbor%dist_rad(1:3, j, s)
                r1 = neighbor%dist_rad(4, j, s)
                CALL nnp_calc_rad(nnp, ind, s, rvect1, r1, symtmp, forcetmp)
                jj = neighbor%ind_rad(j, s)
-               DO sf = 1, nnp%rad(ind)%symfgrp(s)%n_symf
-                  m = nnp%rad(ind)%symfgrp(s)%symf(sf)
+               DO sf = 1, sg%n_symf
+                  m = sg%symf(sf)
                   ! update forces into dsymdxyz
                   DO l = 1, 3
                      dsymdxyz(m, l, i) = dsymdxyz(m, l, i) + forcetmp(l, sf)
@@ -246,6 +255,7 @@ CONTAINS
                   nnp%rad(ind)%y(m) = nnp%rad(ind)%y(m) + symtmp(sf)
                END DO
             END DO
+            END ASSOCIATE
             NULLIFY(symtmp)
             NULLIFY(forcetmp)
          END DO
@@ -269,50 +279,74 @@ CONTAINS
             END IF
             symtmp => scratch_sym(1:nnp%ang(ind)%symfgrp(s)%n_symf)
             force3tmp => scratch_force3tmp(:,:, 1:nnp%ang(ind)%symfgrp(s)%n_symf)
-            ! Hoist f_c(r1) and f_c(r2) out of the k-loop: precompute for all neighbors in
-            ! ang1 (and ang2 for mixed-species) before entering the O(C^2) triple loop.
-            fc_needed = neighbor%n_ang1(s)
-            IF (nnp%ang(ind)%symfgrp(s)%ele(1) /= nnp%ang(ind)%symfgrp(s)%ele(2)) &
-               fc_needed = MAX(fc_needed, neighbor%n_ang2(s))
-            IF (scratch_max_fc < fc_needed) THEN
-               IF (ALLOCATED(scratch_fc1)) &
-                  DEALLOCATE(scratch_fc1, scratch_dfc1, scratch_fc2, scratch_dfc2)
-               ALLOCATE(scratch_fc1(fc_needed), scratch_dfc1(fc_needed))
-               ALLOCATE(scratch_fc2(fc_needed), scratch_dfc2(fc_needed))
-               scratch_max_fc = fc_needed
-            END IF
-            SELECT CASE (nnp%cut_type)
-            CASE (nnp_cut_cos)
-               DO j = 1, neighbor%n_ang1(s)
-                  fc_tmp = neighbor%dist_ang1(4, j, s)*nnp%ang(ind)%symfgrp(s)%pi_over_cut
-                  scratch_fc1(j) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp, y1=dfc_tmp) + 1.0_dp)
-                  scratch_dfc1(j) = 0.5_dp*dfc_tmp*nnp%ang(ind)%symfgrp(s)%pi_over_cut
-               END DO
-               IF (nnp%ang(ind)%symfgrp(s)%ele(1) /= nnp%ang(ind)%symfgrp(s)%ele(2)) THEN
-                  DO k = 1, neighbor%n_ang2(s)
-                     fc_tmp = neighbor%dist_ang2(4, k, s)*nnp%ang(ind)%symfgrp(s)%pi_over_cut
-                     scratch_fc2(k) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp, y1=dfc_tmp) + 1.0_dp)
-                     scratch_dfc2(k) = 0.5_dp*dfc_tmp*nnp%ang(ind)%symfgrp(s)%pi_over_cut
-                  END DO
+            ! Hoist k-loop invariants out of the O(C^2) triple loop:
+            !   fc1, dfc1dr  (cutoff value + d/dr at r1)  — depend only on j
+            !   fc2, dfc2dr  (mixed-element case only)    — depend only on k
+            !   dr1dx, dr2dx (rvect/r unit vectors)       — depend only on j (or k)
+            ASSOCIATE (sg => nnp%ang(ind)%symfgrp(s))
+               fc_needed = neighbor%n_ang1(s)
+               IF (sg%ele(1) /= sg%ele(2)) fc_needed = MAX(fc_needed, neighbor%n_ang2(s))
+               IF (scratch_max_fc < fc_needed) THEN
+                  IF (ALLOCATED(scratch_fc1)) &
+                     DEALLOCATE(scratch_fc1, scratch_dfc1, scratch_fc2, scratch_dfc2, &
+                                scratch_dr1dx, scratch_dr2dx)
+                  ALLOCATE(scratch_fc1(fc_needed), scratch_dfc1(fc_needed))
+                  ALLOCATE(scratch_fc2(fc_needed), scratch_dfc2(fc_needed))
+                  ALLOCATE(scratch_dr1dx(3, fc_needed), scratch_dr2dx(3, fc_needed))
+                  scratch_max_fc = fc_needed
                END IF
-            CASE (nnp_cut_tanh)
-               DO j = 1, neighbor%n_ang1(s)
-                  fc_tmp = 1.0_dp - neighbor%dist_ang1(4, j, s)*nnp%ang(ind)%symfgrp(s)%inv_cut
-                  tanh_v = hermite_spline_value(spl_tanh, fc_tmp)
-                  scratch_fc1(j) = tanh_v**3
-                  scratch_dfc1(j) = (-3.0_dp*nnp%ang(ind)%symfgrp(s)%inv_cut)*(tanh_v**2 - tanh_v**4)
-               END DO
-               IF (nnp%ang(ind)%symfgrp(s)%ele(1) /= nnp%ang(ind)%symfgrp(s)%ele(2)) THEN
-                  DO k = 1, neighbor%n_ang2(s)
-                     fc_tmp = 1.0_dp - neighbor%dist_ang2(4, k, s)*nnp%ang(ind)%symfgrp(s)%inv_cut
+               SELECT CASE (cut_type)
+               CASE (nnp_cut_cos)
+                  DO j = 1, neighbor%n_ang1(s)
+                     r1 = neighbor%dist_ang1(4, j, s)
+                     fc_tmp = r1*sg%pi_over_cut
+                     scratch_fc1(j) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp, y1=dfc_tmp) + 1.0_dp)
+                     scratch_dfc1(j) = 0.5_dp*dfc_tmp*sg%pi_over_cut
+                     r1inv = 1.0_dp/r1
+                     scratch_dr1dx(1, j) = neighbor%dist_ang1(1, j, s)*r1inv
+                     scratch_dr1dx(2, j) = neighbor%dist_ang1(2, j, s)*r1inv
+                     scratch_dr1dx(3, j) = neighbor%dist_ang1(3, j, s)*r1inv
+                  END DO
+                  IF (sg%ele(1) /= sg%ele(2)) THEN
+                     DO k = 1, neighbor%n_ang2(s)
+                        r2 = neighbor%dist_ang2(4, k, s)
+                        fc_tmp = r2*sg%pi_over_cut
+                        scratch_fc2(k) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp, y1=dfc_tmp) + 1.0_dp)
+                        scratch_dfc2(k) = 0.5_dp*dfc_tmp*sg%pi_over_cut
+                        r2inv = 1.0_dp/r2
+                        scratch_dr2dx(1, k) = neighbor%dist_ang2(1, k, s)*r2inv
+                        scratch_dr2dx(2, k) = neighbor%dist_ang2(2, k, s)*r2inv
+                        scratch_dr2dx(3, k) = neighbor%dist_ang2(3, k, s)*r2inv
+                     END DO
+                  END IF
+               CASE (nnp_cut_tanh)
+                  DO j = 1, neighbor%n_ang1(s)
+                     r1 = neighbor%dist_ang1(4, j, s)
+                     fc_tmp = 1.0_dp - r1*sg%inv_cut
                      tanh_v = hermite_spline_value(spl_tanh, fc_tmp)
-                     scratch_fc2(k) = tanh_v**3
-                     scratch_dfc2(k) = (-3.0_dp*nnp%ang(ind)%symfgrp(s)%inv_cut)*(tanh_v**2 - tanh_v**4)
+                     scratch_fc1(j) = tanh_v**3
+                     scratch_dfc1(j) = (-3.0_dp*sg%inv_cut)*(tanh_v**2 - tanh_v**4)
+                     r1inv = 1.0_dp/r1
+                     scratch_dr1dx(1, j) = neighbor%dist_ang1(1, j, s)*r1inv
+                     scratch_dr1dx(2, j) = neighbor%dist_ang1(2, j, s)*r1inv
+                     scratch_dr1dx(3, j) = neighbor%dist_ang1(3, j, s)*r1inv
                   END DO
-               END IF
-            END SELECT
-            !loop over associated neighbors
-            IF (nnp%ang(ind)%symfgrp(s)%ele(1) == nnp%ang(ind)%symfgrp(s)%ele(2)) THEN
+                  IF (sg%ele(1) /= sg%ele(2)) THEN
+                     DO k = 1, neighbor%n_ang2(s)
+                        r2 = neighbor%dist_ang2(4, k, s)
+                        fc_tmp = 1.0_dp - r2*sg%inv_cut
+                        tanh_v = hermite_spline_value(spl_tanh, fc_tmp)
+                        scratch_fc2(k) = tanh_v**3
+                        scratch_dfc2(k) = (-3.0_dp*sg%inv_cut)*(tanh_v**2 - tanh_v**4)
+                        r2inv = 1.0_dp/r2
+                        scratch_dr2dx(1, k) = neighbor%dist_ang2(1, k, s)*r2inv
+                        scratch_dr2dx(2, k) = neighbor%dist_ang2(2, k, s)*r2inv
+                        scratch_dr2dx(3, k) = neighbor%dist_ang2(3, k, s)*r2inv
+                     END DO
+                  END IF
+               END SELECT
+               !loop over associated neighbors
+               IF (sg%ele(1) == sg%ele(2)) THEN
                DO j = 1, neighbor%n_ang1(s)
                   rvect1 = neighbor%dist_ang1(1:3, j, s)
                   r1 = neighbor%dist_ang1(4, j, s)
@@ -320,16 +354,20 @@ CONTAINS
                      rvect2 = neighbor%dist_ang1(1:3, k, s)
                      r2 = neighbor%dist_ang1(4, k, s)
                      rvect3 = rvect2 - rvect1
-                     r3 = NORM2(rvect3(:))
-                     IF (r3 < nnp%ang(ind)%symfgrp(s)%cutoff) THEN
+                     ! Compare squared distance against squared cutoff to avoid sqrt for ~50–75%
+                     ! of (j,k) pairs that fail the cutoff.  Only compute r3 itself when needed.
+                     r3sq = rvect3(1)*rvect3(1) + rvect3(2)*rvect3(2) + rvect3(3)*rvect3(3)
+                     IF (r3sq < sg%cutoff_sq) THEN
+                        r3 = SQRT(r3sq)
                         jj = neighbor%ind_ang1(j, s)
                         kk = neighbor%ind_ang1(k, s)
                         CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, &
                                           r1, r2, r3, symtmp, force3tmp, &
                                           fc1_in=scratch_fc1(j), fc2_in=scratch_fc1(k), &
-                                          dfc1dr_in=scratch_dfc1(j), dfc2dr_in=scratch_dfc1(k))
-                        DO sf = 1, nnp%ang(ind)%symfgrp(s)%n_symf
-                           m = off + nnp%ang(ind)%symfgrp(s)%symf(sf)
+                                          dfc1dr_in=scratch_dfc1(j), dfc2dr_in=scratch_dfc1(k), &
+                                          dr1dx_in=scratch_dr1dx(:, j), dr2dx_in=scratch_dr1dx(:, k))
+                        DO sf = 1, sg%n_symf
+                           m = off + sg%symf(sf)
                            ! update forces into dsymdxy
                            DO l = 1, 3
                               dsymdxyz(m, l, i) = dsymdxyz(m, l, i) &
@@ -358,17 +396,19 @@ CONTAINS
                      rvect2 = neighbor%dist_ang2(1:3, k, s)
                      r2 = neighbor%dist_ang2(4, k, s)
                      rvect3 = rvect2 - rvect1
-                     r3 = NORM2(rvect3(:))
-                     IF (r3 < nnp%ang(ind)%symfgrp(s)%cutoff) THEN
+                     r3sq = rvect3(1)*rvect3(1) + rvect3(2)*rvect3(2) + rvect3(3)*rvect3(3)
+                     IF (r3sq < sg%cutoff_sq) THEN
+                        r3 = SQRT(r3sq)
                         jj = neighbor%ind_ang1(j, s)
                         kk = neighbor%ind_ang2(k, s)
                         CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, &
                                           r1, r2, r3, symtmp, force3tmp, &
                                           fc1_in=scratch_fc1(j), fc2_in=scratch_fc2(k), &
-                                          dfc1dr_in=scratch_dfc1(j), dfc2dr_in=scratch_dfc2(k))
+                                          dfc1dr_in=scratch_dfc1(j), dfc2dr_in=scratch_dfc2(k), &
+                                          dr1dx_in=scratch_dr1dx(:, j), dr2dx_in=scratch_dr2dx(:, k))
                         !loop over associated sym fncts
-                        DO sf = 1, nnp%ang(ind)%symfgrp(s)%n_symf
-                           m = off + nnp%ang(ind)%symfgrp(s)%symf(sf)
+                        DO sf = 1, sg%n_symf
+                           m = off + sg%symf(sf)
                            ! update forces into dsymdxy
                            DO l = 1, 3
                               dsymdxyz(m, l, i) = dsymdxyz(m, l, i) &
@@ -390,6 +430,7 @@ CONTAINS
                   END DO
                END DO
             END IF
+            END ASSOCIATE
             NULLIFY(symtmp)
             NULLIFY(force3tmp)
          END DO
@@ -407,17 +448,19 @@ CONTAINS
                ALLOCATE(scratch_sym(nnp%rad(ind)%symfgrp(s)%n_symf))
                scratch_max_sym = SIZE(scratch_sym)
             END IF
-            symtmp => scratch_sym(1:nnp%rad(ind)%symfgrp(s)%n_symf)
+            ASSOCIATE (sg => nnp%rad(ind)%symfgrp(s))
+            symtmp => scratch_sym(1:sg%n_symf)
             !loop over associated neighbors
             DO j = 1, neighbor%n_rad(s)
                rvect1 = neighbor%dist_rad(1:3, j, s)
                r1 = neighbor%dist_rad(4, j, s)
                CALL nnp_calc_rad(nnp, ind, s, rvect1, r1, symtmp)
-               DO sf = 1, nnp%rad(ind)%symfgrp(s)%n_symf
-                  m = nnp%rad(ind)%symfgrp(s)%symf(sf)
+               DO sf = 1, sg%n_symf
+                  m = sg%symf(sf)
                   nnp%rad(ind)%y(m) = nnp%rad(ind)%y(m) + symtmp(sf)
                END DO
             END DO
+            END ASSOCIATE
             NULLIFY(symtmp)
          END DO
          CALL timestop(handle_sf)
@@ -434,43 +477,46 @@ CONTAINS
                scratch_max_sym = SIZE(scratch_sym)
             END IF
             symtmp => scratch_sym(1:nnp%ang(ind)%symfgrp(s)%n_symf)
+            ASSOCIATE (sg => nnp%ang(ind)%symfgrp(s))
             ! Hoist f_c(r1) and f_c(r2) out of the k-loop
             fc_needed = neighbor%n_ang1(s)
-            IF (nnp%ang(ind)%symfgrp(s)%ele(1) /= nnp%ang(ind)%symfgrp(s)%ele(2)) &
+            IF (sg%ele(1) /= sg%ele(2)) &
                fc_needed = MAX(fc_needed, neighbor%n_ang2(s))
             IF (scratch_max_fc < fc_needed) THEN
                IF (ALLOCATED(scratch_fc1)) &
-                  DEALLOCATE(scratch_fc1, scratch_dfc1, scratch_fc2, scratch_dfc2)
+                  DEALLOCATE(scratch_fc1, scratch_dfc1, scratch_fc2, scratch_dfc2, &
+                             scratch_dr1dx, scratch_dr2dx)
                ALLOCATE(scratch_fc1(fc_needed), scratch_dfc1(fc_needed))
                ALLOCATE(scratch_fc2(fc_needed), scratch_dfc2(fc_needed))
+               ALLOCATE(scratch_dr1dx(3, fc_needed), scratch_dr2dx(3, fc_needed))
                scratch_max_fc = fc_needed
             END IF
-            SELECT CASE (nnp%cut_type)
+            SELECT CASE (cut_type)
             CASE (nnp_cut_cos)
                DO j = 1, neighbor%n_ang1(s)
-                  fc_tmp = neighbor%dist_ang1(4, j, s)*nnp%ang(ind)%symfgrp(s)%pi_over_cut
+                  fc_tmp = neighbor%dist_ang1(4, j, s)*sg%pi_over_cut
                   scratch_fc1(j) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp) + 1.0_dp)
                END DO
-               IF (nnp%ang(ind)%symfgrp(s)%ele(1) /= nnp%ang(ind)%symfgrp(s)%ele(2)) THEN
+               IF (sg%ele(1) /= sg%ele(2)) THEN
                   DO k = 1, neighbor%n_ang2(s)
-                     fc_tmp = neighbor%dist_ang2(4, k, s)*nnp%ang(ind)%symfgrp(s)%pi_over_cut
+                     fc_tmp = neighbor%dist_ang2(4, k, s)*sg%pi_over_cut
                      scratch_fc2(k) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp) + 1.0_dp)
                   END DO
                END IF
             CASE (nnp_cut_tanh)
                DO j = 1, neighbor%n_ang1(s)
-                  fc_tmp = 1.0_dp - neighbor%dist_ang1(4, j, s)*nnp%ang(ind)%symfgrp(s)%inv_cut
+                  fc_tmp = 1.0_dp - neighbor%dist_ang1(4, j, s)*sg%inv_cut
                   scratch_fc1(j) = hermite_spline_value(spl_tanh, fc_tmp)**3
                END DO
-               IF (nnp%ang(ind)%symfgrp(s)%ele(1) /= nnp%ang(ind)%symfgrp(s)%ele(2)) THEN
+               IF (sg%ele(1) /= sg%ele(2)) THEN
                   DO k = 1, neighbor%n_ang2(s)
-                     fc_tmp = 1.0_dp - neighbor%dist_ang2(4, k, s)*nnp%ang(ind)%symfgrp(s)%inv_cut
+                     fc_tmp = 1.0_dp - neighbor%dist_ang2(4, k, s)*sg%inv_cut
                      scratch_fc2(k) = hermite_spline_value(spl_tanh, fc_tmp)**3
                   END DO
                END IF
             END SELECT
             !loop over associated neighbors
-            IF (nnp%ang(ind)%symfgrp(s)%ele(1) == nnp%ang(ind)%symfgrp(s)%ele(2)) THEN
+            IF (sg%ele(1) == sg%ele(2)) THEN
                DO j = 1, neighbor%n_ang1(s)
                   rvect1 = neighbor%dist_ang1(1:3, j, s)
                   r1 = neighbor%dist_ang1(4, j, s)
@@ -478,12 +524,13 @@ CONTAINS
                      rvect2 = neighbor%dist_ang1(1:3, k, s)
                      r2 = neighbor%dist_ang1(4, k, s)
                      rvect3 = rvect2 - rvect1
-                     r3 = NORM2(rvect3(:))
-                     IF (r3 < nnp%ang(ind)%symfgrp(s)%cutoff) THEN
+                     r3sq = rvect3(1)*rvect3(1) + rvect3(2)*rvect3(2) + rvect3(3)*rvect3(3)
+                     IF (r3sq < sg%cutoff_sq) THEN
+                        r3 = SQRT(r3sq)
                         CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, r1, r2, r3, symtmp, &
                                           fc1_in=scratch_fc1(j), fc2_in=scratch_fc1(k))
-                        DO sf = 1, nnp%ang(ind)%symfgrp(s)%n_symf
-                           m = off + nnp%ang(ind)%symfgrp(s)%symf(sf)
+                        DO sf = 1, sg%n_symf
+                           m = off + sg%symf(sf)
                            nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + symtmp(sf)
                         END DO
                      END IF
@@ -497,19 +544,21 @@ CONTAINS
                      rvect2 = neighbor%dist_ang2(1:3, k, s)
                      r2 = neighbor%dist_ang2(4, k, s)
                      rvect3 = rvect2 - rvect1
-                     r3 = NORM2(rvect3(:))
-                     IF (r3 < nnp%ang(ind)%symfgrp(s)%cutoff) THEN
+                     r3sq = rvect3(1)*rvect3(1) + rvect3(2)*rvect3(2) + rvect3(3)*rvect3(3)
+                     IF (r3sq < sg%cutoff_sq) THEN
+                        r3 = SQRT(r3sq)
                         CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, r1, r2, r3, symtmp, &
                                           fc1_in=scratch_fc1(j), fc2_in=scratch_fc2(k))
                         !loop over associated sym fncts
-                        DO sf = 1, nnp%ang(ind)%symfgrp(s)%n_symf
-                           m = off + nnp%ang(ind)%symfgrp(s)%symf(sf)
+                        DO sf = 1, sg%n_symf
+                           m = off + sg%symf(sf)
                            nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + symtmp(sf)
                         END DO
                      END IF
                   END DO
                END DO
             END IF
+            END ASSOCIATE
             NULLIFY(symtmp)
          END DO
          CALL timestop(handle_sf)
@@ -804,7 +853,7 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(:, :), INTENT(OUT), &
          OPTIONAL                                        :: force
 
-      INTEGER                                            :: k, sf
+      INTEGER                                            :: k, sf, cut_type
       REAL(KIND=dp)                                      :: dfcutdr, dsymdr, eta, fcut, funccut, rs, &
                                                             tmp, dcos_dx, tanh_val, rinv
       REAL(KIND=dp), DIMENSION(3)                        :: drdx
@@ -814,11 +863,16 @@ CONTAINS
       fcut = 0.0_dp
       dfcutdr = 0.0_dp
 
+      ! Hoist invariants: cut_type is constant for the run; the symfgrp ASSOCIATE alias collapses
+      ! the chain of derived-type field accesses inside hot inner loops.
+      cut_type = nnp%cut_type
+      ASSOCIATE (sg => nnp%rad(ind)%symfgrp(s))
+
       !Calculate cutoff function and partial derivative
-      funccut = nnp%rad(ind)%symfgrp(s)%cutoff !cutoff
-      SELECT CASE (nnp%cut_type)
+      funccut = sg%cutoff !cutoff
+      SELECT CASE (cut_type)
       CASE (nnp_cut_cos)
-         tmp = r * nnp%rad(ind)%symfgrp(s)%pi_over_cut
+         tmp = r * sg%pi_over_cut
          IF (PRESENT(force)) THEN
             fcut = 0.5_dp*(hermite_spline_value(spl_cos, tmp, y1=dcos_dx) + 1.0_dp)
             dfcutdr = 0.5_dp*dcos_dx*(pi/funccut)
@@ -827,7 +881,7 @@ CONTAINS
          END IF
 
       CASE (nnp_cut_tanh)
-         tmp = 1.0_dp - r * nnp%rad(ind)%symfgrp(s)%inv_cut
+         tmp = 1.0_dp - r * sg%inv_cut
          tanh_val = hermite_spline_value(spl_tanh, tmp)
          fcut = tanh_val**3
          IF (PRESENT(force)) &
@@ -846,8 +900,8 @@ CONTAINS
       END IF
 
       !loop over sym fncts of sym fnct group s
-      DO sf = 1, nnp%rad(ind)%symfgrp(s)%n_symf
-         k = nnp%rad(ind)%symfgrp(s)%symf(sf) !symf indice
+      DO sf = 1, sg%n_symf
+         k = sg%symf(sf) !symf indice
          eta = nnp%rad(ind)%eta(k) !eta
          rs = nnp%rad(ind)%rs(k) !rshift
 
@@ -871,6 +925,7 @@ CONTAINS
          END IF
          sym(sf) = sym(sf)*fcut
       END DO
+      END ASSOCIATE
 
    END SUBROUTINE nnp_calc_rad
 
@@ -892,7 +947,7 @@ CONTAINS
 !> \author Christoph Schran (christoph.schran@rub.de)
 ! **************************************************************************************************
    SUBROUTINE nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, r1, r2, r3, sym, force, &
-                            fc1_in, fc2_in, dfc1dr_in, dfc2dr_in)
+                            fc1_in, fc2_in, dfc1dr_in, dfc2dr_in, dr1dx_in, dr2dx_in)
 
       TYPE(nnp_type), INTENT(IN)                         :: nnp
       INTEGER, INTENT(IN)                                :: ind, s
@@ -903,8 +958,9 @@ CONTAINS
          OPTIONAL                                        :: force
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: fc1_in, fc2_in
       REAL(KIND=dp), INTENT(IN), OPTIONAL                :: dfc1dr_in, dfc2dr_in
+      REAL(KIND=dp), DIMENSION(3), INTENT(IN), OPTIONAL  :: dr1dx_in, dr2dx_in
 
-      INTEGER                                            :: i, m, sf
+      INTEGER                                            :: i, m, sf, cut_type
       REAL(KIND=dp) :: angular, costheta, dfcutdr1, dfcutdr2, dfcutdr3, dsymdr1, dsymdr2, dsymdr3, &
          eta, f, fcut, fcut1, fcut2, fcut3, ftot, g, g_sq_inv, lam, pref, prefzeta, rsqr1, rsqr2, &
          rsqr3, r_sum_sq, r1inv, r2inv, r3inv, symtmp, tmp, tmp1, tmp2, tmp3, tmpzeta, zeta
@@ -913,6 +969,7 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(3) :: dangulardx1, dangulardx2, dangulardx3, dcosthetadx1, &
          dcosthetadx2, dcosthetadx3, dfdx1, dfdx2, dfdx3, dgdx1, dgdx2, dgdx3, dr1dx, dr2dx, dr3dx
 
+      cut_type = nnp%cut_type
       rsqr1 = r1**2
       rsqr2 = r2**2
       rsqr3 = r3**2
@@ -935,17 +992,18 @@ CONTAINS
       costheta = f/g
 
       ! Calculate cutoff function and partial derivatives
-      fcut = nnp%ang(ind)%symfgrp(s)%cutoff !cutoff
-      SELECT CASE (nnp%cut_type)
+      ASSOCIATE (sg => nnp%ang(ind)%symfgrp(s))
+      fcut = sg%cutoff !cutoff
+      SELECT CASE (cut_type)
       CASE (nnp_cut_cos)
-         tmp3 = r3 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
+         tmp3 = r3 * sg%pi_over_cut
          IF (PRESENT(force)) THEN
             fcut3 = 0.5_dp*(hermite_spline_value(spl_cos, tmp3, y1=dcos_dx3) + 1.0_dp)
             IF (PRESENT(fc1_in)) THEN
                fcut1 = fc1_in;  fcut2 = fc2_in
             ELSE
-               tmp1 = r1 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
-               tmp2 = r2 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
+               tmp1 = r1 * sg%pi_over_cut
+               tmp2 = r2 * sg%pi_over_cut
                fcut1 = 0.5_dp*(hermite_spline_value(spl_cos, tmp1, y1=dcos_dx1) + 1.0_dp)
                fcut2 = 0.5_dp*(hermite_spline_value(spl_cos, tmp2, y1=dcos_dx2) + 1.0_dp)
             END IF
@@ -954,8 +1012,8 @@ CONTAINS
             IF (PRESENT(fc1_in)) THEN
                fcut1 = fc1_in;  fcut2 = fc2_in
             ELSE
-               tmp1 = r1 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
-               tmp2 = r2 * nnp%ang(ind)%symfgrp(s)%pi_over_cut
+               tmp1 = r1 * sg%pi_over_cut
+               tmp2 = r2 * sg%pi_over_cut
                fcut1 = 0.5_dp*(hermite_spline_value(spl_cos, tmp1) + 1.0_dp)
                fcut2 = 0.5_dp*(hermite_spline_value(spl_cos, tmp2) + 1.0_dp)
             END IF
@@ -974,14 +1032,14 @@ CONTAINS
          END IF
 
       CASE (nnp_cut_tanh)
-         tmp3 = 1.0_dp - r3 * nnp%ang(ind)%symfgrp(s)%inv_cut
+         tmp3 = 1.0_dp - r3 * sg%inv_cut
          tanh_val3 = hermite_spline_value(spl_tanh, tmp3)
          fcut3 = tanh_val3**3
          IF (PRESENT(fc1_in)) THEN
             fcut1 = fc1_in;  fcut2 = fc2_in
          ELSE
-            tmp1 = 1.0_dp - r1 * nnp%ang(ind)%symfgrp(s)%inv_cut
-            tmp2 = 1.0_dp - r2 * nnp%ang(ind)%symfgrp(s)%inv_cut
+            tmp1 = 1.0_dp - r1 * sg%inv_cut
+            tmp2 = 1.0_dp - r2 * sg%inv_cut
             tanh_val1 = hermite_spline_value(spl_tanh, tmp1)
             tanh_val2 = hermite_spline_value(spl_tanh, tmp2)
             fcut1 = tanh_val1**3
@@ -1003,14 +1061,24 @@ CONTAINS
       CASE DEFAULT
          CPABORT("NNP| Cutoff function unknown")
       END SELECT
+      END ASSOCIATE
 
       IF (PRESENT(force)) THEN
-         ! 1 division -> 3 multiplies per pair-distance
-         r1inv = 1.0_dp/r1
-         r2inv = 1.0_dp/r2
+         ! Use precomputed per-j unit vectors when available (saves 2 divisions per (j,k) pair).
+         IF (PRESENT(dr1dx_in)) THEN
+            dr1dx(1) = dr1dx_in(1); dr1dx(2) = dr1dx_in(2); dr1dx(3) = dr1dx_in(3)
+         ELSE
+            r1inv = 1.0_dp/r1
+            dr1dx(1) = rvect1(1)*r1inv; dr1dx(2) = rvect1(2)*r1inv; dr1dx(3) = rvect1(3)*r1inv
+         END IF
+         IF (PRESENT(dr2dx_in)) THEN
+            dr2dx(1) = dr2dx_in(1); dr2dx(2) = dr2dx_in(2); dr2dx(3) = dr2dx_in(3)
+         ELSE
+            r2inv = 1.0_dp/r2
+            dr2dx(1) = rvect2(1)*r2inv; dr2dx(2) = rvect2(2)*r2inv; dr2dx(3) = rvect2(3)*r2inv
+         END IF
+         ! r3 is per-(j,k) — always compute the unit vector here.
          r3inv = 1.0_dp/r3
-         dr1dx(1) = rvect1(1)*r1inv; dr1dx(2) = rvect1(2)*r1inv; dr1dx(3) = rvect1(3)*r1inv
-         dr2dx(1) = rvect2(1)*r2inv; dr2dx(2) = rvect2(2)*r2inv; dr2dx(3) = rvect2(3)*r2inv
          dr3dx(1) = rvect3(1)*r3inv; dr3dx(2) = rvect3(2)*r3inv; dr3dx(3) = rvect3(3)*r3inv
       END IF
 
@@ -1021,12 +1089,14 @@ CONTAINS
       g_sq_inv = 1.0_dp/(g*g)
 
       !loop over associated sym fncts
-      DO sf = 1, nnp%ang(ind)%symfgrp(s)%n_symf
-         m = nnp%ang(ind)%symfgrp(s)%symf(sf)
-         lam = nnp%ang(ind)%lam(m) !lambda
-         zeta = nnp%ang(ind)%zeta(m) !zeta
-         prefzeta = nnp%ang(ind)%prefzeta(m) ! 2**(1-zeta)
-         eta = nnp%ang(ind)%eta(m) !eta
+      ASSOCIATE (sg => nnp%ang(ind)%symfgrp(s), &
+                 a  => nnp%ang(ind))
+      DO sf = 1, sg%n_symf
+         m = sg%symf(sf)
+         lam = a%lam(m) !lambda
+         zeta = a%zeta(m) !zeta
+         prefzeta = a%prefzeta(m) ! 2**(1-zeta)
+         eta = a%eta(m) !eta
 
          tmp = (1.0_dp + lam*costheta)
 
@@ -1038,8 +1108,8 @@ CONTAINS
 
          ! Calculate angular symmetry function.  zeta_is_int / zeta_int are precomputed once
          ! at init from the (post-sort) zeta values; no NINT or FP-equality test in the hot loop.
-         IF (nnp%ang(ind)%zeta_is_int(m)) THEN
-            tmpzeta = tmp**(nnp%ang(ind)%zeta_int(m) - 1)
+         IF (a%zeta_is_int(m)) THEN
+            tmpzeta = tmp**(a%zeta_int(m) - 1)
          ELSE
             tmpzeta = tmp**(zeta - 1.0_dp)
          END IF
@@ -1099,6 +1169,7 @@ CONTAINS
          pref = prefzeta
          sym(sf) = pref*angular*symtmp*ftot
       END DO
+      END ASSOCIATE
 
    END SUBROUTINE nnp_calc_ang
 
