@@ -693,6 +693,38 @@ CONTAINS
          CALL parser_release(parser)
       END IF
 
+      ! Pre-compute scaling factors used by nnp_scale_acsf so the per-(centre, neighbour)
+      ! divides become a single multiply.  scmax/scmin and loc_max/loc_min/sigma are all
+      ! now known and frozen for the run.
+      IF (nnp_env%scale_acsf .OR. nnp_env%scale_sigma_acsf) THEN
+         DO i = 1, nnp_env%n_ele
+            IF (nnp_env%scale_acsf) THEN
+               ALLOCATE (nnp_env%rad(i)%scale_factor(nnp_env%n_rad(i)))
+               ALLOCATE (nnp_env%ang(i)%scale_factor(nnp_env%n_ang(i)))
+               DO j = 1, nnp_env%n_rad(i)
+                  nnp_env%rad(i)%scale_factor(j) = (nnp_env%scmax - nnp_env%scmin) / &
+                     (nnp_env%rad(i)%loc_max(j) - nnp_env%rad(i)%loc_min(j))
+               END DO
+               DO j = 1, nnp_env%n_ang(i)
+                  nnp_env%ang(i)%scale_factor(j) = (nnp_env%scmax - nnp_env%scmin) / &
+                     (nnp_env%ang(i)%loc_max(j) - nnp_env%ang(i)%loc_min(j))
+               END DO
+            END IF
+            IF (nnp_env%scale_sigma_acsf) THEN
+               ALLOCATE (nnp_env%rad(i)%inv_sigma_factor(nnp_env%n_rad(i)))
+               ALLOCATE (nnp_env%ang(i)%inv_sigma_factor(nnp_env%n_ang(i)))
+               DO j = 1, nnp_env%n_rad(i)
+                  nnp_env%rad(i)%inv_sigma_factor(j) = (nnp_env%scmax - nnp_env%scmin) / &
+                     nnp_env%rad(i)%sigma(j)
+               END DO
+               DO j = 1, nnp_env%n_ang(i)
+                  nnp_env%ang(i)%inv_sigma_factor(j) = (nnp_env%scmax - nnp_env%scmin) / &
+                     nnp_env%ang(i)%sigma(j)
+               END DO
+            END IF
+         END DO
+      END IF
+
       CALL nnp_init_acsf_groups(nnp_env)
 
       ! read weights from file

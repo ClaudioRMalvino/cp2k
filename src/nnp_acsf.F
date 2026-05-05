@@ -56,8 +56,8 @@ MODULE nnp_acsf
 !>        (bin_width ~ list_cutoff, bin_span = 1) so each centre atom walks 27 bins.  Rebuild is
 !>        triggered only by Verlet-skin violation (any atom moved > 0.5*skin) or by changes to
 !>        num_atoms / cell vectors / cutoff.
-!> \author Claudio Malvino
 !> \date   2026-04-24
+!> \author Claudio Malvino
 ! **************************************************************************************************
    TYPE, PRIVATE :: nnp_cell_list_cache_type
       LOGICAL                              :: initialized   = .FALSE.
@@ -78,21 +78,19 @@ MODULE nnp_acsf
       REAL(KIND=dp), DIMENSION(3, 3)       :: hmat          = 0.0_dp
       REAL(KIND=dp), DIMENSION(3, 3)       :: h_inv         = 0.0_dp
       ! Primary (PBC-wrapped) atom positions — refreshed every prepare call
-      REAL(KIND=dp), ALLOCATABLE           :: coord_primary(:, :)         ! (3, num_atoms)
+      REAL(KIND=dp), ALLOCATABLE           :: coord_primary(:, :)         
       ! Snapshot of coord_primary at the last rebuild (Verlet reference)
-      REAL(KIND=dp), ALLOCATABLE           :: ref_coord_primary(:, :)     ! (3, num_atoms)
+      REAL(KIND=dp), ALLOCATABLE           :: ref_coord_primary(:, :)     
       ! Image table: one entry per (atom j, integer PBC shift) pair
-      INTEGER, ALLOCATABLE                 :: image_atom(:)               ! (n_images)
-      INTEGER, ALLOCATABLE                 :: image_shift(:, :)           ! (3, n_images)
-      REAL(KIND=dp), ALLOCATABLE           :: image_translation(:, :)     ! (3, n_images)
+      INTEGER, ALLOCATABLE                 :: image_atom(:)               
+      INTEGER, ALLOCATABLE                 :: image_shift(:, :)           
+      REAL(KIND=dp), ALLOCATABLE           :: image_translation(:, :)     
       ! Linked-list cell grid: head(n_cells) → first image in bin, next(n_images) chains images
-      INTEGER, ALLOCATABLE                 :: head(:)                     ! (n_cells)
-      INTEGER, ALLOCATABLE                 :: next(:)                     ! (n_images)
+      INTEGER, ALLOCATABLE                 :: head(:)                     
+      INTEGER, ALLOCATABLE                 :: next(:)                     
    END TYPE nnp_cell_list_cache_type
 
    ! Module-level Hermite cubic splines built once at first call to nnp_init_acsf_groups.
-   ! spl_exp covers EXP on [-50, 0]; spl_cos covers COS on [0, pi]; spl_tanh covers TANH on [0, 1].
-   ! y2 stores h*y'(x_i) as required by hermite_spline_value (splines_methods.F).
    TYPE(spline_data_type), SAVE, PRIVATE :: spl_exp, spl_cos, spl_tanh
    LOGICAL, SAVE, PRIVATE                :: spline_initialized = .FALSE.
    TYPE(nnp_cell_list_cache_type), SAVE, PRIVATE :: cell_list_cache
@@ -226,6 +224,13 @@ CONTAINS
                END IF
             END DO
          END DO
+         ! Sort active_atoms(1:n_active) in ascending order so subsequent walks (especially
+         ! nnp_scale_acsf) hit dsymdxyz(:, :, k) in increasing k order — turns sparse-random
+         ! atom indices into prefetcher-friendly streaming and improves TLB locality.
+         ! In-place heap sort: O(n log n) worst case, zero allocations.  n_active is
+         ! geometrically bounded (cutoff sphere × density) but heap sort keeps the algorithm
+         ! asymptotically clean for arbitrary system sizes.
+         IF (n_active > 1) CALL nnp_sort_active_atoms(active_atoms, n_active)
       END IF
 
       ! Reset y:
@@ -347,8 +352,9 @@ CONTAINS
 
             ASSOCIATE (sg => nnp%ang(ind)%symfgrp(s))
             ! Hoist k-loop invariants (fc1/fc2/dr1dx/dr2dx) — these scratch arrays are SHARED
-            ! across threads; one thread fills them under !$OMP SINGLE so all threads see the
-            ! values when the implicit barrier at end of SINGLE is reached.
+            ! across threads.  One thread does the realloc check under !$OMP SINGLE; the
+            ! precompute itself is then split across the team via !$OMP DO so every thread
+            ! does its share of the spline evaluations instead of waiting on a single thread.
             !$OMP SINGLE
             fc_needed = neighbor%n_ang1(s)
             IF (sg%ele(1) /= sg%ele(2)) fc_needed = MAX(fc_needed, neighbor%n_ang2(s))
@@ -361,8 +367,11 @@ CONTAINS
                ALLOCATE(scratch_dr1dx(3, fc_needed), scratch_dr2dx(3, fc_needed))
                scratch_max_fc = fc_needed
             END IF
+            !$OMP END SINGLE
+            ! implicit barrier ensures the (re)allocation is visible to every thread
             SELECT CASE (cut_type)
             CASE (nnp_cut_cos)
+               !$OMP DO SCHEDULE(static)
                DO j = 1, neighbor%n_ang1(s)
                   r1 = neighbor%dist_ang1(4, j, s)
                   fc_tmp = r1*sg%pi_over_cut
@@ -373,7 +382,9 @@ CONTAINS
                   scratch_dr1dx(2, j) = neighbor%dist_ang1(2, j, s)*r1inv
                   scratch_dr1dx(3, j) = neighbor%dist_ang1(3, j, s)*r1inv
                END DO
+               !$OMP END DO
                IF (sg%ele(1) /= sg%ele(2)) THEN
+                  !$OMP DO SCHEDULE(static)
                   DO k = 1, neighbor%n_ang2(s)
                      r2 = neighbor%dist_ang2(4, k, s)
                      fc_tmp = r2*sg%pi_over_cut
@@ -384,8 +395,10 @@ CONTAINS
                      scratch_dr2dx(2, k) = neighbor%dist_ang2(2, k, s)*r2inv
                      scratch_dr2dx(3, k) = neighbor%dist_ang2(3, k, s)*r2inv
                   END DO
+                  !$OMP END DO
                END IF
             CASE (nnp_cut_tanh)
+               !$OMP DO SCHEDULE(static)
                DO j = 1, neighbor%n_ang1(s)
                   r1 = neighbor%dist_ang1(4, j, s)
                   fc_tmp = 1.0_dp - r1*sg%inv_cut
@@ -397,7 +410,9 @@ CONTAINS
                   scratch_dr1dx(2, j) = neighbor%dist_ang1(2, j, s)*r1inv
                   scratch_dr1dx(3, j) = neighbor%dist_ang1(3, j, s)*r1inv
                END DO
+               !$OMP END DO
                IF (sg%ele(1) /= sg%ele(2)) THEN
+                  !$OMP DO SCHEDULE(static)
                   DO k = 1, neighbor%n_ang2(s)
                      r2 = neighbor%dist_ang2(4, k, s)
                      fc_tmp = 1.0_dp - r2*sg%inv_cut
@@ -409,13 +424,15 @@ CONTAINS
                      scratch_dr2dx(2, k) = neighbor%dist_ang2(2, k, s)*r2inv
                      scratch_dr2dx(3, k) = neighbor%dist_ang2(3, k, s)*r2inv
                   END DO
+                  !$OMP END DO
                END IF
             END SELECT
-            !$OMP END SINGLE
-            ! implicit barrier at end of SINGLE — all threads now see scratch_fc*/dr*
+            ! implicit barrier at end of last !$OMP DO publishes scratch_fc*/dr* to all threads
 
             IF (sg%ele(1) == sg%ele(2)) THEN
-               !$OMP DO SCHEDULE(dynamic)
+               ! Triangular k-loop (k = j+1..n_ang1) — can't COLLAPSE.  Earlier j has more
+               ! work, so dynamic with a small chunk handles the imbalance with low overhead.
+               !$OMP DO SCHEDULE(dynamic, 4)
                DO j = 1, neighbor%n_ang1(s)
                   rvect1 = neighbor%dist_ang1(1:3, j, s)
                   r1 = neighbor%dist_ang1(4, j, s)
@@ -459,11 +476,15 @@ CONTAINS
                END DO
                !$OMP END DO NOWAIT
             ELSE
-               !$OMP DO SCHEDULE(dynamic)
+               ! Rectangular j-k loop — COLLAPSE(2) flattens the iteration space so threads
+               ! stay busy when n_ang1 alone is too small for the team.  Loops must be
+               ! perfectly nested to use COLLAPSE; the j-only rvect1/r1 reads are moved
+               ! inside (cheap — they hit L1 cache).
+               !$OMP DO COLLAPSE(2) SCHEDULE(dynamic, 16)
                DO j = 1, neighbor%n_ang1(s)
-                  rvect1 = neighbor%dist_ang1(1:3, j, s)
-                  r1 = neighbor%dist_ang1(4, j, s)
                   DO k = 1, neighbor%n_ang2(s)
+                     rvect1 = neighbor%dist_ang1(1:3, j, s)
+                     r1 = neighbor%dist_ang1(4, j, s)
                      rvect2 = neighbor%dist_ang2(1:3, k, s)
                      r2 = neighbor%dist_ang2(4, k, s)
                      rvect3 = rvect2 - rvect1
@@ -599,7 +620,8 @@ CONTAINS
             local_y(1:n_symf_s) = 0.0_dp
 
             ASSOCIATE (sg => nnp%ang(ind)%symfgrp(s))
-            ! Shared scratch_fc* precompute under SINGLE; implicit barrier publishes the values.
+            ! Realloc check under SINGLE; the precompute itself is parallelised across the team
+            ! (matches the with-forces variant — see comment there for rationale).
             !$OMP SINGLE
             fc_needed = neighbor%n_ang1(s)
             IF (sg%ele(1) /= sg%ele(2)) &
@@ -613,34 +635,44 @@ CONTAINS
                ALLOCATE(scratch_dr1dx(3, fc_needed), scratch_dr2dx(3, fc_needed))
                scratch_max_fc = fc_needed
             END IF
+            !$OMP END SINGLE
+            ! implicit barrier ensures the (re)allocation is visible to every thread
             SELECT CASE (cut_type)
             CASE (nnp_cut_cos)
+               !$OMP DO SCHEDULE(static)
                DO j = 1, neighbor%n_ang1(s)
                   fc_tmp = neighbor%dist_ang1(4, j, s)*sg%pi_over_cut
                   scratch_fc1(j) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp) + 1.0_dp)
                END DO
+               !$OMP END DO
                IF (sg%ele(1) /= sg%ele(2)) THEN
+                  !$OMP DO SCHEDULE(static)
                   DO k = 1, neighbor%n_ang2(s)
                      fc_tmp = neighbor%dist_ang2(4, k, s)*sg%pi_over_cut
                      scratch_fc2(k) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp) + 1.0_dp)
                   END DO
+                  !$OMP END DO
                END IF
             CASE (nnp_cut_tanh)
+               !$OMP DO SCHEDULE(static)
                DO j = 1, neighbor%n_ang1(s)
                   fc_tmp = 1.0_dp - neighbor%dist_ang1(4, j, s)*sg%inv_cut
                   scratch_fc1(j) = hermite_spline_value(spl_tanh, fc_tmp)**3
                END DO
+               !$OMP END DO
                IF (sg%ele(1) /= sg%ele(2)) THEN
+                  !$OMP DO SCHEDULE(static)
                   DO k = 1, neighbor%n_ang2(s)
                      fc_tmp = 1.0_dp - neighbor%dist_ang2(4, k, s)*sg%inv_cut
                      scratch_fc2(k) = hermite_spline_value(spl_tanh, fc_tmp)**3
                   END DO
+                  !$OMP END DO
                END IF
             END SELECT
-            !$OMP END SINGLE
+            ! implicit barrier at end of last !$OMP DO publishes scratch_fc* to all threads
 
             IF (sg%ele(1) == sg%ele(2)) THEN
-               !$OMP DO SCHEDULE(dynamic)
+               !$OMP DO SCHEDULE(dynamic, 4)
                DO j = 1, neighbor%n_ang1(s)
                   rvect1 = neighbor%dist_ang1(1:3, j, s)
                   r1 = neighbor%dist_ang1(4, j, s)
@@ -661,11 +693,11 @@ CONTAINS
                END DO
                !$OMP END DO NOWAIT
             ELSE
-               !$OMP DO SCHEDULE(dynamic)
+               !$OMP DO COLLAPSE(2) SCHEDULE(dynamic, 16)
                DO j = 1, neighbor%n_ang1(s)
-                  rvect1 = neighbor%dist_ang1(1:3, j, s)
-                  r1 = neighbor%dist_ang1(4, j, s)
                   DO k = 1, neighbor%n_ang2(s)
+                     rvect1 = neighbor%dist_ang1(1:3, j, s)
+                     r1 = neighbor%dist_ang1(4, j, s)
                      rvect2 = neighbor%dist_ang2(1:3, k, s)
                      r2 = neighbor%dist_ang2(4, k, s)
                      rvect3 = rvect2 - rvect1
@@ -784,6 +816,10 @@ CONTAINS
 
       INTEGER                                            :: idx, j, k, off
 
+      ! Build the input layer (node) array from the centre's symmetry function values.
+      ! Small loop (n_rad + n_ang elements) — kept serial.  Sub-expressions like
+      ! (scmax-scmin)/(loc_max-loc_min) are now folded into nnp%*%scale_factor and
+      ! nnp%*%inv_sigma_factor, filled once at init in nnp_init_model.
       IF (nnp%center_acsf) THEN
          DO j = 1, nnp%n_rad(ind)
             nnp%arc(ind)%layer(1)%node(j) = &
@@ -798,45 +834,37 @@ CONTAINS
          IF (nnp%scale_acsf) THEN
             DO j = 1, nnp%n_rad(ind)
                nnp%arc(ind)%layer(1)%node(j) = &
-                  nnp%arc(ind)%layer(1)%node(j)/ &
-                  (nnp%rad(ind)%loc_max(j) - nnp%rad(ind)%loc_min(j))* &
-                  (nnp%scmax - nnp%scmin) + nnp%scmin
+                  nnp%arc(ind)%layer(1)%node(j)*nnp%rad(ind)%scale_factor(j) + nnp%scmin
             END DO
             off = nnp%n_rad(ind)
             DO j = 1, nnp%n_ang(ind)
                nnp%arc(ind)%layer(1)%node(j + off) = &
-                  nnp%arc(ind)%layer(1)%node(j + off)/ &
-                  (nnp%ang(ind)%loc_max(j) - nnp%ang(ind)%loc_min(j))* &
-                  (nnp%scmax - nnp%scmin) + nnp%scmin
+                  nnp%arc(ind)%layer(1)%node(j + off)*nnp%ang(ind)%scale_factor(j) + nnp%scmin
             END DO
          END IF
       ELSE IF (nnp%scale_acsf) THEN
          DO j = 1, nnp%n_rad(ind)
             nnp%arc(ind)%layer(1)%node(j) = &
-               (nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_min(j))/ &
-               (nnp%rad(ind)%loc_max(j) - nnp%rad(ind)%loc_min(j))* &
-               (nnp%scmax - nnp%scmin) + nnp%scmin
+               (nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_min(j))*nnp%rad(ind)%scale_factor(j) &
+               + nnp%scmin
          END DO
          off = nnp%n_rad(ind)
          DO j = 1, nnp%n_ang(ind)
             nnp%arc(ind)%layer(1)%node(j + off) = &
-               (nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_min(j))/ &
-               (nnp%ang(ind)%loc_max(j) - nnp%ang(ind)%loc_min(j))* &
-               (nnp%scmax - nnp%scmin) + nnp%scmin
+               (nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_min(j))*nnp%ang(ind)%scale_factor(j) &
+               + nnp%scmin
          END DO
       ELSE IF (nnp%scale_sigma_acsf) THEN
          DO j = 1, nnp%n_rad(ind)
             nnp%arc(ind)%layer(1)%node(j) = &
-               (nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_av(j))/ &
-               nnp%rad(ind)%sigma(j)* &
-               (nnp%scmax - nnp%scmin) + nnp%scmin
+               (nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_av(j))*nnp%rad(ind)%inv_sigma_factor(j) &
+               + nnp%scmin
          END DO
          off = nnp%n_rad(ind)
          DO j = 1, nnp%n_ang(ind)
             nnp%arc(ind)%layer(1)%node(j + off) = &
-               (nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_av(j))/ &
-               nnp%ang(ind)%sigma(j)* &
-               (nnp%scmax - nnp%scmin) + nnp%scmin
+               (nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_av(j))*nnp%ang(ind)%inv_sigma_factor(j) &
+               + nnp%scmin
          END DO
       ELSE
          DO j = 1, nnp%n_rad(ind)
@@ -848,84 +876,82 @@ CONTAINS
          END DO
       END IF
 
-      ! dsymdxyz scaling: walk only the active atoms when the caller provided them
-      ! (drops O(num_atoms) per centre to O(n_active) ≈ O(1) at fixed density).
+      ! dsymdxyz scaling: this is the hot path (walks active atoms × sym fncts every centre,
+      ! every step).  Each (idx, j) pair writes a unique dsymdxyz(j, :, k) slot — no atomics
+      ! needed.  COLLAPSE(2) flattens the (idx, j) iteration space so threads stay busy when
+      ! either dimension is small relative to the team.
       IF (PRESENT(dsymdxyz)) THEN
          IF (nnp%scale_acsf) THEN
             IF (PRESENT(active_atoms) .AND. PRESENT(n_active)) THEN
+               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(idx, j, k) SCHEDULE(static)
                DO idx = 1, n_active
-                  k = active_atoms(idx)
                   DO j = 1, nnp%n_rad(ind)
-                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)/ &
-                                         (nnp%rad(ind)%loc_max(j) - &
-                                          nnp%rad(ind)%loc_min(j))* &
-                                         (nnp%scmax - nnp%scmin)
+                     k = active_atoms(idx)
+                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)*nnp%rad(ind)%scale_factor(j)
                   END DO
                END DO
+               !$OMP END PARALLEL DO
                off = nnp%n_rad(ind)
+               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(idx, j, k) SCHEDULE(static)
                DO idx = 1, n_active
-                  k = active_atoms(idx)
                   DO j = 1, nnp%n_ang(ind)
-                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)/ &
-                                               (nnp%ang(ind)%loc_max(j) - &
-                                                nnp%ang(ind)%loc_min(j))* &
-                                               (nnp%scmax - nnp%scmin)
+                     k = active_atoms(idx)
+                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)*nnp%ang(ind)%scale_factor(j)
                   END DO
                END DO
+               !$OMP END PARALLEL DO
             ELSE
+               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(k, j) SCHEDULE(static)
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_rad(ind)
-                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)/ &
-                                         (nnp%rad(ind)%loc_max(j) - &
-                                          nnp%rad(ind)%loc_min(j))* &
-                                         (nnp%scmax - nnp%scmin)
+                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)*nnp%rad(ind)%scale_factor(j)
                   END DO
                END DO
+               !$OMP END PARALLEL DO
                off = nnp%n_rad(ind)
+               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(k, j) SCHEDULE(static)
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_ang(ind)
-                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)/ &
-                                               (nnp%ang(ind)%loc_max(j) - &
-                                                nnp%ang(ind)%loc_min(j))* &
-                                               (nnp%scmax - nnp%scmin)
+                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)*nnp%ang(ind)%scale_factor(j)
                   END DO
                END DO
+               !$OMP END PARALLEL DO
             END IF
          ELSE IF (nnp%scale_sigma_acsf) THEN
             IF (PRESENT(active_atoms) .AND. PRESENT(n_active)) THEN
+               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(idx, j, k) SCHEDULE(static)
                DO idx = 1, n_active
-                  k = active_atoms(idx)
                   DO j = 1, nnp%n_rad(ind)
-                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)/ &
-                                         nnp%rad(ind)%sigma(j)* &
-                                         (nnp%scmax - nnp%scmin)
+                     k = active_atoms(idx)
+                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)*nnp%rad(ind)%inv_sigma_factor(j)
                   END DO
                END DO
+               !$OMP END PARALLEL DO
                off = nnp%n_rad(ind)
+               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(idx, j, k) SCHEDULE(static)
                DO idx = 1, n_active
-                  k = active_atoms(idx)
                   DO j = 1, nnp%n_ang(ind)
-                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)/ &
-                                               nnp%ang(ind)%sigma(j)* &
-                                               (nnp%scmax - nnp%scmin)
+                     k = active_atoms(idx)
+                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)*nnp%ang(ind)%inv_sigma_factor(j)
                   END DO
                END DO
+               !$OMP END PARALLEL DO
             ELSE
+               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(k, j) SCHEDULE(static)
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_rad(ind)
-                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)/ &
-                                         nnp%rad(ind)%sigma(j)* &
-                                         (nnp%scmax - nnp%scmin)
+                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)*nnp%rad(ind)%inv_sigma_factor(j)
                   END DO
                END DO
+               !$OMP END PARALLEL DO
                off = nnp%n_rad(ind)
+               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(k, j) SCHEDULE(static)
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_ang(ind)
-                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)/ &
-                                               nnp%ang(ind)%sigma(j)* &
-                                               (nnp%scmax - nnp%scmin)
+                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)*nnp%ang(ind)%inv_sigma_factor(j)
                   END DO
                END DO
+               !$OMP END PARALLEL DO
             END IF
          END IF
       END IF
@@ -933,29 +959,19 @@ CONTAINS
       IF (PRESENT(stress)) THEN
          IF (nnp%scale_acsf) THEN
             DO j = 1, nnp%n_rad(ind)
-               stress(:, :, j) = stress(:, :, j)/ &
-                                 (nnp%rad(ind)%loc_max(j) - &
-                                  nnp%rad(ind)%loc_min(j))* &
-                                 (nnp%scmax - nnp%scmin)
+               stress(:, :, j) = stress(:, :, j)*nnp%rad(ind)%scale_factor(j)
             END DO
             off = nnp%n_rad(ind)
             DO j = 1, nnp%n_ang(ind)
-               stress(:, :, j + off) = stress(:, :, j + off)/ &
-                                       (nnp%ang(ind)%loc_max(j) - &
-                                        nnp%ang(ind)%loc_min(j))* &
-                                       (nnp%scmax - nnp%scmin)
+               stress(:, :, j + off) = stress(:, :, j + off)*nnp%ang(ind)%scale_factor(j)
             END DO
          ELSE IF (nnp%scale_sigma_acsf) THEN
             DO j = 1, nnp%n_rad(ind)
-               stress(:, :, j) = stress(:, :, j)/ &
-                                 nnp%rad(ind)%sigma(j)* &
-                                 (nnp%scmax - nnp%scmin)
+               stress(:, :, j) = stress(:, :, j)*nnp%rad(ind)%inv_sigma_factor(j)
             END DO
             off = nnp%n_rad(ind)
             DO j = 1, nnp%n_ang(ind)
-               stress(:, :, j + off) = stress(:, :, j + off)/ &
-                                       nnp%ang(ind)%sigma(j)* &
-                                       (nnp%scmax - nnp%scmin)
+               stress(:, :, j + off) = stress(:, :, j + off)*nnp%ang(ind)%inv_sigma_factor(j)
             END DO
          END IF
       END IF
@@ -1304,6 +1320,62 @@ CONTAINS
       END ASSOCIATE
 
    END SUBROUTINE nnp_calc_ang
+
+! **************************************************************************************************
+!> \brief In-place ascending heap sort over arr(1:n).
+!>        Used by nnp_calc_acsf to order the per-centre active_atoms list so downstream
+!>        walks — especially nnp_scale_acsf — touch dsymdxyz(:, :, k) in increasing k
+!>        order (prefetcher-friendly streaming, better TLB locality).
+!>        Heap sort is O(n log n) worst case and operates fully in place: zero
+!>        ALLOCATE/DEALLOCATE traffic.  This matters when scaling to large systems —
+!>        n_active itself stays geometrically bounded (cutoff sphere × density), but
+!>        a quadratic sort would still be unacceptable across millions of centres.
+!> \param arr  array sorted in place
+!> \param n    number of valid entries (sort arr(1:n))
+! **************************************************************************************************
+   PURE SUBROUTINE nnp_sort_active_atoms(arr, n)
+      INTEGER, DIMENSION(:), INTENT(INOUT)               :: arr
+      INTEGER, INTENT(IN)                                :: n
+
+      INTEGER                                            :: child, heap_size, last, root, &
+                                                            start, tmp_val
+
+      IF (n < 2) RETURN
+
+      ! Phase 1 — build a max-heap.  Sift down each non-leaf node from the middle of the
+      ! array up to the root; afterwards arr(1) holds the max.
+      DO start = n/2, 1, -1
+         root = start
+         heap_size = n
+         DO WHILE (2*root <= heap_size)
+            child = 2*root
+            IF (child < heap_size) THEN
+               IF (arr(child) < arr(child + 1)) child = child + 1
+            END IF
+            IF (arr(root) >= arr(child)) EXIT
+            tmp_val = arr(root); arr(root) = arr(child); arr(child) = tmp_val
+            root = child
+         END DO
+      END DO
+
+      ! Phase 2 — repeatedly move the root (max) to the end of the live region and sift
+      ! the new root down within the shrunk heap.  After the loop arr(1:n) is ascending.
+      DO last = n, 2, -1
+         tmp_val = arr(1); arr(1) = arr(last); arr(last) = tmp_val
+         root = 1
+         heap_size = last - 1
+         DO WHILE (2*root <= heap_size)
+            child = 2*root
+            IF (child < heap_size) THEN
+               IF (arr(child) < arr(child + 1)) child = child + 1
+            END IF
+            IF (arr(root) >= arr(child)) EXIT
+            tmp_val = arr(root); arr(root) = arr(child); arr(child) = tmp_val
+            root = child
+         END DO
+      END DO
+
+   END SUBROUTINE nnp_sort_active_atoms
 
 ! **************************************************************************************************
 !> \brief Sort element array according to atomic number

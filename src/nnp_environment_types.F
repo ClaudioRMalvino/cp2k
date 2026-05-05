@@ -182,6 +182,12 @@ MODULE nnp_environment_types
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: loc_max
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: loc_av
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: sigma
+      ! Pre-computed scaling factors (filled once at init in nnp_init_model from the
+      ! parsed scaling.data file).  scale_factor = (scmax - scmin) / (loc_max - loc_min);
+      ! inv_sigma_factor = (scmax - scmin) / sigma.  Used by nnp_scale_acsf to replace
+      ! a per-(centre, sym, neighbour) divide with a single multiply.
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: scale_factor
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: inv_sigma_factor
       CHARACTER(len=2), ALLOCATABLE, DIMENSION(:)         :: ele
       INTEGER, ALLOCATABLE, DIMENSION(:)                  :: nuc_ele
       INTEGER                                             :: n_symfgrp = -1
@@ -225,6 +231,9 @@ MODULE nnp_environment_types
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: loc_max
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: loc_av
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: sigma
+      ! Pre-computed scaling factors (see nnp_acsf_rad_type for definitions).
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: scale_factor
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: inv_sigma_factor
       CHARACTER(len=2), ALLOCATABLE, DIMENSION(:)         :: ele1
       CHARACTER(len=2), ALLOCATABLE, DIMENSION(:)         :: ele2
       INTEGER, ALLOCATABLE, DIMENSION(:)                  :: nuc_ele1
@@ -315,6 +324,10 @@ CONTAINS
                         nnp_env%rad(i)%ele_grp_count, &
                         nnp_env%rad(i)%ele_grp_list, &
                         nnp_env%rad(i)%symfgrp)
+            IF (ALLOCATED(nnp_env%rad(i)%scale_factor)) &
+               DEALLOCATE (nnp_env%rad(i)%scale_factor)
+            IF (ALLOCATED(nnp_env%rad(i)%inv_sigma_factor)) &
+               DEALLOCATE (nnp_env%rad(i)%inv_sigma_factor)
          END DO
          DEALLOCATE (nnp_env%rad)
       END IF
@@ -347,6 +360,10 @@ CONTAINS
                         nnp_env%ang(i)%ele2_grp_count, &
                         nnp_env%ang(i)%ele2_grp_list, &
                         nnp_env%ang(i)%symfgrp)
+            IF (ALLOCATED(nnp_env%ang(i)%scale_factor)) &
+               DEALLOCATE (nnp_env%ang(i)%scale_factor)
+            IF (ALLOCATED(nnp_env%ang(i)%inv_sigma_factor)) &
+               DEALLOCATE (nnp_env%ang(i)%inv_sigma_factor)
          END DO
          DEALLOCATE (nnp_env%ang)
       END IF
