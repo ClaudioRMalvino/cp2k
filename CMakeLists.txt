@@ -621,7 +621,6 @@ message("-                          DBCSR                           -")
 message("------------------------------------------------------------\n")
 
 if(CP2K_USE_DBCSR_CONFIG)
-  find_package(DBCSR 2.9 REQUIRED CONFIG)
   if(CP2K_USE_MPI AND NOT DBCSR_USE_MPI)
     message(
       FATAL_ERROR
@@ -629,7 +628,7 @@ if(CP2K_USE_DBCSR_CONFIG)
     )
   endif()
 else()
-  find_package(DBCSR 2.6 REQUIRED)
+  find_package(DBCSR REQUIRED)
 endif()
 
 # Discover CP2K_OPENCL_BACKEND. DBCSR must be discovered prior (DBCSR_DIR).
