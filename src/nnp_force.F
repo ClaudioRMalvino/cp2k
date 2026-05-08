@@ -144,7 +144,7 @@ CONTAINS
       ! Hoist scratch allocations out of the per-centre loop:
       !   * dsymdxyz is sized to MAX(n_nodes(1)) over element types so the same buffer serves
       !     every centre regardless of element. Its O(num_atoms) third dimension is touched only
-      !     for atoms in the active list — we zero those entries selectively after use.
+      !     for atoms in the active list, we zero those entries selectively after use.
       !   * active_atoms / active_flag track the centre + every neighbour the cell-list walk
       !     touched, so the per-centre force-accumulation walks ~k atoms instead of all N.
       IF (calc_forces) THEN
