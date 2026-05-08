@@ -246,8 +246,16 @@ CONTAINS
 ! **************************************************************************************************
 !> \brief Initialise a Hermite cubic spline on a uniform grid.
 !>      Requires spl%y(1:n) filled with function values, spl%x1 set, and spl%n set
-!>      (e.g. via init_splinexy).  Stores h*dydx in spl%y2 so hermite_spline_value
-!>      needs no extra division per evaluation.
+!>      (e.g. via init_splinexy).  Builds Horner-form polynomial coefficients per
+!>      interval into spl%coef(4, n-1) for use by hermite_spline_value.
+!>
+!>      For each interval [x_i, x_{i+1}] with t = (x - x_i)*invh ∈ [0, 1]:
+!>          p(t) = a_0 + a_1·t + a_2·t² + a_3·t³
+!>      with a_0 = y_i, a_1 = h·y'_i,
+!>           a_2 = -3·y_i + 3·y_{i+1} - 2·h·y'_i - h·y'_{i+1},
+!>           a_3 =  2·y_i - 2·y_{i+1} +   h·y'_i + h·y'_{i+1}.
+!>      This is the same Hermite cubic as the basis form, just pre-collected so the
+!>      evaluator does ~3 MUL + 3 ADD per call instead of ~22 MUL + 12 ADD.
 !> \param spl  spline_data structure with y and n already populated
 !> \param dx   uniform grid spacing
 !> \param dydx first derivatives y'(x_i) at each of the n grid points
@@ -258,12 +266,31 @@ CONTAINS
       REAL(KIND=dp), INTENT(IN)                          :: dx
       REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: dydx
 
+      INTEGER                                            :: i
+      REAL(KIND=dp)                                      :: m0, m1, ylo, yhi
+
       CPASSERT(SIZE(dydx) == spl%n)
       spl%h    = dx
       spl%invh = 1.0_dp/dx
       spl%h26  = dx*dx/6.0_dp
       spl%xn   = spl%x1 + REAL(spl%n - 1, KIND=dp)*dx
-      spl%y2(1:spl%n) = dx*dydx(1:spl%n)
+
+      IF (ASSOCIATED(spl%coef)) THEN
+         DEALLOCATE (spl%coef)
+         NULLIFY (spl%coef)
+      END IF
+      ALLOCATE (spl%coef(4, spl%n - 1))
+
+      DO i = 1, spl%n - 1
+         ylo = spl%y(i)
+         yhi = spl%y(i + 1)
+         m0  = dx*dydx(i)
+         m1  = dx*dydx(i + 1)
+         spl%coef(1, i) = ylo
+         spl%coef(2, i) = m0
+         spl%coef(3, i) = -3.0_dp*ylo + 3.0_dp*yhi - 2.0_dp*m0 - m1
+         spl%coef(4, i) =  2.0_dp*ylo - 2.0_dp*yhi +        m0 + m1
+      END DO
 
    END SUBROUTINE init_hermite_spline
 
@@ -271,7 +298,13 @@ CONTAINS
 !> \brief Evaluate a Hermite cubic spline at xx, returning the interpolated value.
 !>      Optionally returns the first derivative y1 = d(val)/d(xx).
 !>      No out-of-range checks: caller must ensure xx in [spl%x1, spl%xn].
-!>      spl%y2 must hold the scaled tangents h*y'(x_i) as set by init_hermite_spline.
+!>      spl%coef(:, i) must hold the Horner polynomial coefficients as set by
+!>      init_hermite_spline.
+!>
+!>      Horner form: 3 MUL + 3 ADD for the value, 2 MUL + 3 ADD for the derivative.
+!>      Mathematically identical to the basis-function form; the per-evaluation
+!>      cost is roughly 4× lower because the polynomial coefficients are
+!>      pre-collected once at init.
 !> \param spl  Hermite spline data
 !> \param xx   evaluation point
 !> \param y1   (OPTIONAL) first derivative at xx
@@ -285,28 +318,21 @@ CONTAINS
       REAL(KIND=dp)                                      :: val
 
       INTEGER                                            :: i
-      REAL(KIND=dp)                                      :: t, t2, t3, ylo, yhi, m0, m1
+      REAL(KIND=dp)                                      :: c1, c2, c3, c4, t
 
-      i   = INT((xx - spl%x1)*spl%invh) + 1
-      i   = MAX(1, MIN(i, spl%n - 1))
-      t   = (xx - (spl%x1 + REAL(i - 1, KIND=dp)*spl%h))*spl%invh
-      t2  = t*t
-      t3  = t2*t
-      ylo = spl%y(i)
-      yhi = spl%y(i + 1)
-      m0  = spl%y2(i)       ! h * y'(x_i)
-      m1  = spl%y2(i + 1)   ! h * y'(x_{i+1})
+      i = INT((xx - spl%x1)*spl%invh) + 1
+      i = MAX(1, MIN(i, spl%n - 1))
+      t = (xx - (spl%x1 + REAL(i - 1, KIND=dp)*spl%h))*spl%invh
 
-      val = (2.0_dp*t3 - 3.0_dp*t2 + 1.0_dp)*ylo + &
-            (t3 - 2.0_dp*t2 + t)*m0               + &
-            (-2.0_dp*t3 + 3.0_dp*t2)*yhi           + &
-            (t3 - t2)*m1
+      c1 = spl%coef(1, i)
+      c2 = spl%coef(2, i)
+      c3 = spl%coef(3, i)
+      c4 = spl%coef(4, i)
+
+      val = c1 + t*(c2 + t*(c3 + t*c4))
 
       IF (PRESENT(y1)) &
-         y1 = spl%invh*((6.0_dp*t2 - 6.0_dp*t)*ylo         + &
-                        (3.0_dp*t2 - 4.0_dp*t + 1.0_dp)*m0 + &
-                        (-6.0_dp*t2 + 6.0_dp*t)*yhi         + &
-                        (3.0_dp*t2 - 2.0_dp*t)*m1)
+         y1 = spl%invh*(c2 + t*(2.0_dp*c3 + t*3.0_dp*c4))
 
    END FUNCTION hermite_spline_value
 

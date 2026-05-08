@@ -41,6 +41,11 @@ MODULE splines_types
       INTEGER :: ref_count = -1
       REAL(KIND=dp), POINTER :: y(:) => NULL() ! the function values y(x)
       REAL(KIND=dp), POINTER :: y2(:) => NULL() ! the 2nd derivative via interpolation
+      ! Horner coefficients (4, n-1) per interval — populated by init_hermite_spline,
+      ! consumed by hermite_spline_value.  In t = (x - x_i)*invh ∈ [0, 1]:
+      !   p(t) = coef(1,i) + coef(2,i)*t + coef(3,i)*t² + coef(4,i)*t³
+      ! Only used by the Hermite-cubic path; the natural-cubic path uses y2 instead.
+      REAL(KIND=dp), POINTER :: coef(:, :) => NULL()
       INTEGER                 :: n = -1 ! dimension of above arrays
       ! not used if uniform increments
       REAL(KIND=dp)          :: h = -1.0_dp ! uniform increment of x if applicable
@@ -114,6 +119,9 @@ CONTAINS
             END IF
             IF (ASSOCIATED(spline_data%y2)) THEN
                DEALLOCATE (spline_data%y2)
+            END IF
+            IF (ASSOCIATED(spline_data%coef)) THEN
+               DEALLOCATE (spline_data%coef)
             END IF
             DEALLOCATE (spline_data)
          END IF
