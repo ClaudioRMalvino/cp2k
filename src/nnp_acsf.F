@@ -206,6 +206,14 @@ CONTAINS
                END IF
             END DO
          END DO
+
+         ! Sort active_atoms(1:n_active) in ascending order so subsequent walks (especially
+         ! nnp_scale_acsf) hit dsymdxyz(:, :, k) in increasing k order — turns sparse-random
+         ! atom indices into prefetcher-friendly streaming and improves TLB locality.
+         ! In-place heap sort: O(n log n) worst case, zero allocations.  n_active is
+         ! geometrically bounded (cutoff sphere × density) but heap sort keeps the algorithm
+         ! asymptotically clean for arbitrary system sizes.
+         IF (n_active > 1) CALL nnp_sort_active_atoms(active_atoms, n_active)
       END IF
 
       ! Reset y:
@@ -652,6 +660,10 @@ CONTAINS
 
       INTEGER                                            :: idx, j, k, off
 
+      ! Build the input layer (node) array from the centre's symmetry function values.
+      ! Small loop (n_rad + n_ang elements) — kept serial.  Sub-expressions like
+      ! (scmax-scmin)/(loc_max-loc_min) are now folded into nnp%*%scale_factor and
+      ! nnp%*%inv_sigma_factor, filled once at init in nnp_init_model.
       IF (nnp%center_acsf) THEN
          DO j = 1, nnp%n_rad(ind)
             nnp%arc(ind)%layer(1)%node(j) = &
@@ -666,45 +678,37 @@ CONTAINS
          IF (nnp%scale_acsf) THEN
             DO j = 1, nnp%n_rad(ind)
                nnp%arc(ind)%layer(1)%node(j) = &
-                  nnp%arc(ind)%layer(1)%node(j)/ &
-                  (nnp%rad(ind)%loc_max(j) - nnp%rad(ind)%loc_min(j))* &
-                  (nnp%scmax - nnp%scmin) + nnp%scmin
+                  nnp%arc(ind)%layer(1)%node(j)*nnp%rad(ind)%scale_factor(j) + nnp%scmin
             END DO
             off = nnp%n_rad(ind)
             DO j = 1, nnp%n_ang(ind)
                nnp%arc(ind)%layer(1)%node(j + off) = &
-                  nnp%arc(ind)%layer(1)%node(j + off)/ &
-                  (nnp%ang(ind)%loc_max(j) - nnp%ang(ind)%loc_min(j))* &
-                  (nnp%scmax - nnp%scmin) + nnp%scmin
+                  nnp%arc(ind)%layer(1)%node(j + off)*nnp%ang(ind)%scale_factor(j) + nnp%scmin
             END DO
          END IF
       ELSE IF (nnp%scale_acsf) THEN
          DO j = 1, nnp%n_rad(ind)
             nnp%arc(ind)%layer(1)%node(j) = &
-               (nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_min(j))/ &
-               (nnp%rad(ind)%loc_max(j) - nnp%rad(ind)%loc_min(j))* &
-               (nnp%scmax - nnp%scmin) + nnp%scmin
+               (nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_min(j))*nnp%rad(ind)%scale_factor(j) &
+               + nnp%scmin
          END DO
          off = nnp%n_rad(ind)
          DO j = 1, nnp%n_ang(ind)
             nnp%arc(ind)%layer(1)%node(j + off) = &
-               (nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_min(j))/ &
-               (nnp%ang(ind)%loc_max(j) - nnp%ang(ind)%loc_min(j))* &
-               (nnp%scmax - nnp%scmin) + nnp%scmin
+               (nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_min(j))*nnp%ang(ind)%scale_factor(j) &
+               + nnp%scmin
          END DO
       ELSE IF (nnp%scale_sigma_acsf) THEN
          DO j = 1, nnp%n_rad(ind)
             nnp%arc(ind)%layer(1)%node(j) = &
-               (nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_av(j))/ &
-               nnp%rad(ind)%sigma(j)* &
-               (nnp%scmax - nnp%scmin) + nnp%scmin
+               (nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_av(j))*nnp%rad(ind)%inv_sigma_factor(j) &
+               + nnp%scmin
          END DO
          off = nnp%n_rad(ind)
          DO j = 1, nnp%n_ang(ind)
             nnp%arc(ind)%layer(1)%node(j + off) = &
-               (nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_av(j))/ &
-               nnp%ang(ind)%sigma(j)* &
-               (nnp%scmax - nnp%scmin) + nnp%scmin
+               (nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_av(j))*nnp%ang(ind)%inv_sigma_factor(j) &
+               + nnp%scmin
          END DO
       ELSE
          DO j = 1, nnp%n_rad(ind)
@@ -718,44 +722,34 @@ CONTAINS
 
       ! dsymdxyz scaling: walk only the active atoms when the caller provided them
       ! (drops O(num_atoms) per centre to O(n_active) ≈ O(1) at fixed density).
+      ! Each (idx, j) pair writes a unique dsymdxyz(j, :, k) slot; the active_atoms
+      ! array has been sorted ascending so k strides increasing — prefetcher-friendly.
       IF (PRESENT(dsymdxyz)) THEN
          IF (nnp%scale_acsf) THEN
             IF (PRESENT(active_atoms) .AND. PRESENT(n_active)) THEN
                DO idx = 1, n_active
                   k = active_atoms(idx)
                   DO j = 1, nnp%n_rad(ind)
-                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)/ &
-                                         (nnp%rad(ind)%loc_max(j) - &
-                                          nnp%rad(ind)%loc_min(j))* &
-                                         (nnp%scmax - nnp%scmin)
+                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)*nnp%rad(ind)%scale_factor(j)
                   END DO
                END DO
                off = nnp%n_rad(ind)
                DO idx = 1, n_active
                   k = active_atoms(idx)
                   DO j = 1, nnp%n_ang(ind)
-                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)/ &
-                                               (nnp%ang(ind)%loc_max(j) - &
-                                                nnp%ang(ind)%loc_min(j))* &
-                                               (nnp%scmax - nnp%scmin)
+                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)*nnp%ang(ind)%scale_factor(j)
                   END DO
                END DO
             ELSE
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_rad(ind)
-                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)/ &
-                                         (nnp%rad(ind)%loc_max(j) - &
-                                          nnp%rad(ind)%loc_min(j))* &
-                                         (nnp%scmax - nnp%scmin)
+                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)*nnp%rad(ind)%scale_factor(j)
                   END DO
                END DO
                off = nnp%n_rad(ind)
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_ang(ind)
-                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)/ &
-                                               (nnp%ang(ind)%loc_max(j) - &
-                                                nnp%ang(ind)%loc_min(j))* &
-                                               (nnp%scmax - nnp%scmin)
+                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)*nnp%ang(ind)%scale_factor(j)
                   END DO
                END DO
             END IF
@@ -764,34 +758,26 @@ CONTAINS
                DO idx = 1, n_active
                   k = active_atoms(idx)
                   DO j = 1, nnp%n_rad(ind)
-                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)/ &
-                                         nnp%rad(ind)%sigma(j)* &
-                                         (nnp%scmax - nnp%scmin)
+                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)*nnp%rad(ind)%inv_sigma_factor(j)
                   END DO
                END DO
                off = nnp%n_rad(ind)
                DO idx = 1, n_active
                   k = active_atoms(idx)
                   DO j = 1, nnp%n_ang(ind)
-                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)/ &
-                                               nnp%ang(ind)%sigma(j)* &
-                                               (nnp%scmax - nnp%scmin)
+                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)*nnp%ang(ind)%inv_sigma_factor(j)
                   END DO
                END DO
             ELSE
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_rad(ind)
-                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)/ &
-                                         nnp%rad(ind)%sigma(j)* &
-                                         (nnp%scmax - nnp%scmin)
+                     dsymdxyz(j, :, k) = dsymdxyz(j, :, k)*nnp%rad(ind)%inv_sigma_factor(j)
                   END DO
                END DO
                off = nnp%n_rad(ind)
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_ang(ind)
-                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)/ &
-                                               nnp%ang(ind)%sigma(j)* &
-                                               (nnp%scmax - nnp%scmin)
+                     dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)*nnp%ang(ind)%inv_sigma_factor(j)
                   END DO
                END DO
             END IF
@@ -801,29 +787,19 @@ CONTAINS
       IF (PRESENT(stress)) THEN
          IF (nnp%scale_acsf) THEN
             DO j = 1, nnp%n_rad(ind)
-               stress(:, :, j) = stress(:, :, j)/ &
-                                 (nnp%rad(ind)%loc_max(j) - &
-                                  nnp%rad(ind)%loc_min(j))* &
-                                 (nnp%scmax - nnp%scmin)
+               stress(:, :, j) = stress(:, :, j)*nnp%rad(ind)%scale_factor(j)
             END DO
             off = nnp%n_rad(ind)
             DO j = 1, nnp%n_ang(ind)
-               stress(:, :, j + off) = stress(:, :, j + off)/ &
-                                       (nnp%ang(ind)%loc_max(j) - &
-                                        nnp%ang(ind)%loc_min(j))* &
-                                       (nnp%scmax - nnp%scmin)
+               stress(:, :, j + off) = stress(:, :, j + off)*nnp%ang(ind)%scale_factor(j)
             END DO
          ELSE IF (nnp%scale_sigma_acsf) THEN
             DO j = 1, nnp%n_rad(ind)
-               stress(:, :, j) = stress(:, :, j)/ &
-                                 nnp%rad(ind)%sigma(j)* &
-                                 (nnp%scmax - nnp%scmin)
+               stress(:, :, j) = stress(:, :, j)*nnp%rad(ind)%inv_sigma_factor(j)
             END DO
             off = nnp%n_rad(ind)
             DO j = 1, nnp%n_ang(ind)
-               stress(:, :, j + off) = stress(:, :, j + off)/ &
-                                       nnp%ang(ind)%sigma(j)* &
-                                       (nnp%scmax - nnp%scmin)
+               stress(:, :, j + off) = stress(:, :, j + off)*nnp%ang(ind)%inv_sigma_factor(j)
             END DO
          END IF
       END IF
@@ -2275,5 +2251,59 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE nnp_neighbor_ensure_persistent
+
+! **************************************************************************************************
+!> \brief Sort active_atoms(1:n) in ascending order, in-place, with zero allocations.
+!>      Used by nnp_calc_acsf to make subsequent walks (especially nnp_scale_acsf's
+!>      dsymdxyz(:, :, k) loop) stride k in increasing order — turns sparse-random atom
+!>      indices into prefetcher-friendly streaming.  Heap sort: O(n log n) worst case, no
+!>      recursion, no auxiliary storage — keeps the algorithm asymptotically clean as
+!>      n_active grows with system size.
+!> \param arr  integer array to sort (only arr(1:n) is touched)
+!> \param n    number of valid entries
+! **************************************************************************************************
+   PURE SUBROUTINE nnp_sort_active_atoms(arr, n)
+      INTEGER, DIMENSION(:), INTENT(INOUT)               :: arr
+      INTEGER, INTENT(IN)                                :: n
+
+      INTEGER                                            :: child, heap_size, last, root, &
+                                                            start, tmp_val
+
+      IF (n < 2) RETURN
+
+      ! Phase 1 — build a max-heap.  Sift down each non-leaf node from the middle of the
+      ! array up to the root; afterwards arr(1) holds the max.
+      DO start = n/2, 1, -1
+         root = start
+         heap_size = n
+         DO WHILE (2*root <= heap_size)
+            child = 2*root
+            IF (child < heap_size) THEN
+               IF (arr(child) < arr(child + 1)) child = child + 1
+            END IF
+            IF (arr(root) >= arr(child)) EXIT
+            tmp_val = arr(root); arr(root) = arr(child); arr(child) = tmp_val
+            root = child
+         END DO
+      END DO
+
+      ! Phase 2 — repeatedly move the root (max) to the end of the live region and sift
+      ! the new root down within the shrunk heap.  After the loop arr(1:n) is ascending.
+      DO last = n, 2, -1
+         tmp_val = arr(1); arr(1) = arr(last); arr(last) = tmp_val
+         root = 1
+         heap_size = last - 1
+         DO WHILE (2*root <= heap_size)
+            child = 2*root
+            IF (child < heap_size) THEN
+               IF (arr(child) < arr(child + 1)) child = child + 1
+            END IF
+            IF (arr(root) >= arr(child)) EXIT
+            tmp_val = arr(root); arr(root) = arr(child); arr(child) = tmp_val
+            root = child
+         END DO
+      END DO
+
+   END SUBROUTINE nnp_sort_active_atoms
 
 END MODULE nnp_acsf
