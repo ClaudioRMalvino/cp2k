@@ -1114,6 +1114,7 @@ CONTAINS
          rsqr3, r_sum_sq, r1inv, r2inv, r3inv, symtmp, tmp, tmp1, tmp2, tmp3, tmpzeta, zeta
       REAL(KIND=dp) :: dcos_dx1, dcos_dx2, dcos_dx3
       REAL(KIND=dp) :: tanh_val1, tanh_val2, tanh_val3
+      REAL(KIND=dp) :: pz2, pz4, pz8
       REAL(KIND=dp), DIMENSION(3) :: dangulardx1, dangulardx2, dangulardx3, dcosthetadx1, &
          dcosthetadx2, dcosthetadx3, dfdx1, dfdx2, dfdx3, dgdx1, dgdx2, dgdx3, dr1dx, dr2dx, dr3dx
 
@@ -1256,8 +1257,29 @@ CONTAINS
 
          ! Calculate angular symmetry function.  zeta_is_int / zeta_int are precomputed once
          ! at init from the (post-sort) zeta values; no NINT or FP-equality test in the hot loop.
+         ! SELECT CASE on zeta_int(m) expands the common Behler-Parrinello values
+         ! {1, 2, 4, 8, 16} (exponents {0, 1, 3, 7, 15}) into inlined multiplications,
+         ! eliminating the __powr8i4 libm dispatch flagged by MAQAO CQA.
          IF (a%zeta_is_int(m)) THEN
-            tmpzeta = tmp**(a%zeta_int(m) - 1)
+            SELECT CASE (a%zeta_int(m))
+            CASE (1)
+               tmpzeta = 1.0_dp
+            CASE (2)
+               tmpzeta = tmp
+            CASE (4)
+               tmpzeta = tmp*tmp*tmp
+            CASE (8)
+               pz2 = tmp*tmp
+               pz4 = pz2*pz2
+               tmpzeta = pz4*pz2*tmp
+            CASE (16)
+               pz2 = tmp*tmp
+               pz4 = pz2*pz2
+               pz8 = pz4*pz4
+               tmpzeta = pz8*pz4*pz2*tmp
+            CASE DEFAULT
+               tmpzeta = tmp**(a%zeta_int(m) - 1)
+            END SELECT
          ELSE
             tmpzeta = tmp**(zeta - 1.0_dp)
          END IF
