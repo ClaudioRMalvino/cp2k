@@ -111,6 +111,14 @@ MODULE nnp_acsf
    REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_sym(:)
    REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_forcetmp(:,:)
    REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_force3tmp(:,:,:)
+   ! Local accumulators for centre-i force, stress, and y contributions, indexed by sf.
+   ! The inner (j,k) loops accumulate into these unit-stride arrays; a single reduction
+   ! pass after each symmetry-function group resolves m = sg%symf(sf) and scatters into
+   ! the m-indexed shared arrays.  Same pattern as feature/nnp-native-spline-omp, without
+   ! the !$OMP CRITICAL wrap (single thread per MPI rank here).
+   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: local_y(:)
+   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: local_fi(:,:)
+   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: local_stress(:,:,:)
    ! Pre-computed per-pair cutoff values and their dr-derivatives.
    ! Hoists f_c(r1) and f_c(r2) out of the inner k-loop; fc3(r3) is still per-triplet.
    ! scratch_dr1dx / scratch_dr2dx hold rvect/r unit vectors per neighbour, also k-loop invariant.
@@ -143,7 +151,7 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'nnp_calc_acsf'
 
       INTEGER                                            :: handle, handle_sf, ind, j, jj, k, kk, l, &
-                                                            m, off, s, sf, fc_needed, cut_type
+                                                            m, n_symf_s, off, s, sf, fc_needed, cut_type
       REAL(KIND=dp)                                      :: r1, r2, r3, r3sq, r1inv, r2inv, &
                                                             fc_tmp, dfc_tmp, tanh_v
       REAL(KIND=dp), DIMENSION(:), POINTER, CONTIGUOUS   :: symtmp
@@ -225,43 +233,72 @@ CONTAINS
          !loop over radial sym fnct grps
          CALL timeset('nnp_acsf_radial', handle_sf)
          DO s = 1, nnp%rad(ind)%n_symfgrp
-            ! reuse module-level scratch buffers to avoid repeated alloc/dealloc
-            IF (.NOT. ALLOCATED(scratch_sym)) THEN
-               ALLOCATE(scratch_sym(nnp%rad(ind)%symfgrp(s)%n_symf))
-               ALLOCATE(scratch_forcetmp(3, nnp%rad(ind)%symfgrp(s)%n_symf))
-               ALLOCATE(scratch_force3tmp(3,3,nnp%rad(ind)%symfgrp(s)%n_symf))
-               scratch_max_sym = SIZE(scratch_sym)
-            ELSE IF (scratch_max_sym < nnp%rad(ind)%symfgrp(s)%n_symf) THEN
-               ! grow to fit if necessary
-               DEALLOCATE(scratch_sym); DEALLOCATE(scratch_forcetmp); DEALLOCATE(scratch_force3tmp)
-               ALLOCATE(scratch_sym(nnp%rad(ind)%symfgrp(s)%n_symf))
-               ALLOCATE(scratch_forcetmp(3, nnp%rad(ind)%symfgrp(s)%n_symf))
-               ALLOCATE(scratch_force3tmp(3,3,nnp%rad(ind)%symfgrp(s)%n_symf))
-               scratch_max_sym = SIZE(scratch_sym)
+            n_symf_s = nnp%rad(ind)%symfgrp(s)%n_symf
+            ! Reuse module-level scratch buffers; grow lazily.  Local accumulators
+            ! (local_y, local_fi, local_stress) are sized together so a single
+            ! capacity check suffices.
+            IF (.NOT. ALLOCATED(scratch_sym) .OR. .NOT. ALLOCATED(local_y) .OR. &
+                scratch_max_sym < n_symf_s) THEN
+               IF (ALLOCATED(scratch_sym)) DEALLOCATE(scratch_sym)
+               IF (ALLOCATED(scratch_forcetmp)) DEALLOCATE(scratch_forcetmp)
+               IF (ALLOCATED(scratch_force3tmp)) DEALLOCATE(scratch_force3tmp)
+               IF (ALLOCATED(local_y)) DEALLOCATE(local_y)
+               IF (ALLOCATED(local_fi)) DEALLOCATE(local_fi)
+               IF (ALLOCATED(local_stress)) DEALLOCATE(local_stress)
+               ALLOCATE(scratch_sym(n_symf_s), scratch_forcetmp(3, n_symf_s), &
+                        scratch_force3tmp(3, 3, n_symf_s))
+               ALLOCATE(local_y(n_symf_s), local_fi(3, n_symf_s), local_stress(3, 3, n_symf_s))
+               scratch_max_sym = n_symf_s
             END IF
             ASSOCIATE (sg => nnp%rad(ind)%symfgrp(s))
-            symtmp => scratch_sym(1:sg%n_symf)
-            forcetmp => scratch_forcetmp(:, 1:sg%n_symf)
+            symtmp => scratch_sym(1:n_symf_s)
+            forcetmp => scratch_forcetmp(:, 1:n_symf_s)
+            ! Zero the centre-i accumulators (only the used portion).
+            local_y(1:n_symf_s) = 0.0_dp
+            local_fi(:, 1:n_symf_s) = 0.0_dp
+            IF (PRESENT(stress)) local_stress(:, :, 1:n_symf_s) = 0.0_dp
             !loop over associated neighbors
             DO j = 1, neighbor%n_rad(s)
                rvect1 = neighbor%dist_rad(1:3, j, s)
                r1 = neighbor%dist_rad(4, j, s)
                CALL nnp_calc_rad(nnp, ind, s, rvect1, r1, symtmp, forcetmp)
                jj = neighbor%ind_rad(j, s)
-               DO sf = 1, sg%n_symf
+               DO sf = 1, n_symf_s
                   m = sg%symf(sf)
-                  ! update forces into dsymdxyz
+                  ! Centre-i contributions go into unit-stride locals; neighbour jj
+                  ! is still scattered (different jj per j-iteration, can't dedupe).
                   DO l = 1, 3
-                     dsymdxyz(m, l, i) = dsymdxyz(m, l, i) + forcetmp(l, sf)
+                     local_fi(l, sf) = local_fi(l, sf) + forcetmp(l, sf)
                      dsymdxyz(m, l, jj) = dsymdxyz(m, l, jj) - forcetmp(l, sf)
                   END DO
                   IF (PRESENT(stress)) THEN
-                     DO l = 1, 3
-                        stress(:, l, m) = stress(:, l, m) + rvect1(:)*forcetmp(l, sf)
-                     END DO
+                     local_stress(1, 1, sf) = local_stress(1, 1, sf) + rvect1(1)*forcetmp(1, sf)
+                     local_stress(2, 1, sf) = local_stress(2, 1, sf) + rvect1(2)*forcetmp(1, sf)
+                     local_stress(3, 1, sf) = local_stress(3, 1, sf) + rvect1(3)*forcetmp(1, sf)
+                     local_stress(1, 2, sf) = local_stress(1, 2, sf) + rvect1(1)*forcetmp(2, sf)
+                     local_stress(2, 2, sf) = local_stress(2, 2, sf) + rvect1(2)*forcetmp(2, sf)
+                     local_stress(3, 2, sf) = local_stress(3, 2, sf) + rvect1(3)*forcetmp(2, sf)
+                     local_stress(1, 3, sf) = local_stress(1, 3, sf) + rvect1(1)*forcetmp(3, sf)
+                     local_stress(2, 3, sf) = local_stress(2, 3, sf) + rvect1(2)*forcetmp(3, sf)
+                     local_stress(3, 3, sf) = local_stress(3, 3, sf) + rvect1(3)*forcetmp(3, sf)
                   END IF
-                  nnp%rad(ind)%y(m) = nnp%rad(ind)%y(m) + symtmp(sf)
+                  local_y(sf) = local_y(sf) + symtmp(sf)
                END DO
+            END DO
+            ! Single reduction: scatter the centre-i locals into the m-indexed shared arrays.
+            DO sf = 1, n_symf_s
+               m = sg%symf(sf)
+               DO l = 1, 3
+                  dsymdxyz(m, l, i) = dsymdxyz(m, l, i) + local_fi(l, sf)
+               END DO
+               IF (PRESENT(stress)) THEN
+                  DO l = 1, 3
+                     stress(1, l, m) = stress(1, l, m) + local_stress(1, l, sf)
+                     stress(2, l, m) = stress(2, l, m) + local_stress(2, l, sf)
+                     stress(3, l, m) = stress(3, l, m) + local_stress(3, l, sf)
+                  END DO
+               END IF
+               nnp%rad(ind)%y(m) = nnp%rad(ind)%y(m) + local_y(sf)
             END DO
             END ASSOCIATE
             NULLIFY(symtmp)
@@ -272,21 +309,28 @@ CONTAINS
          CALL timeset('nnp_acsf_angular', handle_sf)
          off = nnp%n_rad(ind)
          DO s = 1, nnp%ang(ind)%n_symfgrp
-            ! reuse module-level scratch buffers to avoid repeated alloc/dealloc
-            IF (.NOT. ALLOCATED(scratch_sym)) THEN
-               ALLOCATE(scratch_sym(nnp%ang(ind)%symfgrp(s)%n_symf))
-               ALLOCATE(scratch_forcetmp(3, nnp%ang(ind)%symfgrp(s)%n_symf))
-               ALLOCATE(scratch_force3tmp(3,3,nnp%ang(ind)%symfgrp(s)%n_symf))
-               scratch_max_sym = SIZE(scratch_sym)
-            ELSE IF (scratch_max_sym < nnp%ang(ind)%symfgrp(s)%n_symf) THEN
-               DEALLOCATE(scratch_sym); DEALLOCATE(scratch_forcetmp); DEALLOCATE(scratch_force3tmp)
-               ALLOCATE(scratch_sym(nnp%ang(ind)%symfgrp(s)%n_symf))
-               ALLOCATE(scratch_forcetmp(3, nnp%ang(ind)%symfgrp(s)%n_symf))
-               ALLOCATE(scratch_force3tmp(3,3,nnp%ang(ind)%symfgrp(s)%n_symf))
-               scratch_max_sym = SIZE(scratch_sym)
+            n_symf_s = nnp%ang(ind)%symfgrp(s)%n_symf
+            ! Reuse module-level scratch buffers; grow lazily.  Local accumulators
+            ! (local_y, local_fi, local_stress) are sized together with scratch_sym.
+            IF (.NOT. ALLOCATED(scratch_sym) .OR. .NOT. ALLOCATED(local_y) .OR. &
+                scratch_max_sym < n_symf_s) THEN
+               IF (ALLOCATED(scratch_sym)) DEALLOCATE(scratch_sym)
+               IF (ALLOCATED(scratch_forcetmp)) DEALLOCATE(scratch_forcetmp)
+               IF (ALLOCATED(scratch_force3tmp)) DEALLOCATE(scratch_force3tmp)
+               IF (ALLOCATED(local_y)) DEALLOCATE(local_y)
+               IF (ALLOCATED(local_fi)) DEALLOCATE(local_fi)
+               IF (ALLOCATED(local_stress)) DEALLOCATE(local_stress)
+               ALLOCATE(scratch_sym(n_symf_s), scratch_forcetmp(3, n_symf_s), &
+                        scratch_force3tmp(3, 3, n_symf_s))
+               ALLOCATE(local_y(n_symf_s), local_fi(3, n_symf_s), local_stress(3, 3, n_symf_s))
+               scratch_max_sym = n_symf_s
             END IF
-            symtmp => scratch_sym(1:nnp%ang(ind)%symfgrp(s)%n_symf)
-            force3tmp => scratch_force3tmp(:,:, 1:nnp%ang(ind)%symfgrp(s)%n_symf)
+            symtmp => scratch_sym(1:n_symf_s)
+            force3tmp => scratch_force3tmp(:, :, 1:n_symf_s)
+            ! Zero the centre-i accumulators before the (j,k) loop nests
+            local_y(1:n_symf_s) = 0.0_dp
+            local_fi(:, 1:n_symf_s) = 0.0_dp
+            IF (PRESENT(stress)) local_stress(:, :, 1:n_symf_s) = 0.0_dp
             ! Hoist k-loop invariants out of the O(C^2) triple loop:
             !   fc1, dfc1dr  (cutoff value + d/dr at r1)  — depend only on j
             !   fc2, dfc2dr  (mixed-element case only)    — depend only on k
@@ -374,24 +418,26 @@ CONTAINS
                                           fc1_in=scratch_fc1(j), fc2_in=scratch_fc1(k), &
                                           dfc1dr_in=scratch_dfc1(j), dfc2dr_in=scratch_dfc1(k), &
                                           dr1dx_in=scratch_dr1dx(:, j), dr2dx_in=scratch_dr1dx(:, k))
-                        DO sf = 1, sg%n_symf
+                        DO sf = 1, n_symf_s
                            m = off + sg%symf(sf)
-                           ! update forces into dsymdxy
+                           ! Centre-i contributions to unit-stride locals; neighbours jj/kk
+                           ! still scattered (different jj,kk per (j,k)-iteration).
                            DO l = 1, 3
-                              dsymdxyz(m, l, i) = dsymdxyz(m, l, i) &
-                                                  + force3tmp(l, 1, sf)
-                              dsymdxyz(m, l, jj) = dsymdxyz(m, l, jj) &
-                                                   + force3tmp(l, 2, sf)
-                              dsymdxyz(m, l, kk) = dsymdxyz(m, l, kk) &
-                                                   + force3tmp(l, 3, sf)
+                              local_fi(l, sf) = local_fi(l, sf) + force3tmp(l, 1, sf)
+                              dsymdxyz(m, l, jj) = dsymdxyz(m, l, jj) + force3tmp(l, 2, sf)
+                              dsymdxyz(m, l, kk) = dsymdxyz(m, l, kk) + force3tmp(l, 3, sf)
                            END DO
                            IF (PRESENT(stress)) THEN
                               DO l = 1, 3
-                                 stress(:, l, m) = stress(:, l, m) - rvect1(:)*force3tmp(l, 2, sf)
-                                 stress(:, l, m) = stress(:, l, m) - rvect2(:)*force3tmp(l, 3, sf)
+                                 local_stress(1, l, sf) = local_stress(1, l, sf) &
+                                    - rvect1(1)*force3tmp(l, 2, sf) - rvect2(1)*force3tmp(l, 3, sf)
+                                 local_stress(2, l, sf) = local_stress(2, l, sf) &
+                                    - rvect1(2)*force3tmp(l, 2, sf) - rvect2(2)*force3tmp(l, 3, sf)
+                                 local_stress(3, l, sf) = local_stress(3, l, sf) &
+                                    - rvect1(3)*force3tmp(l, 2, sf) - rvect2(3)*force3tmp(l, 3, sf)
                               END DO
                            END IF
-                           nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + symtmp(sf)
+                           local_y(sf) = local_y(sf) + symtmp(sf)
                         END DO
                      END IF
                   END DO
@@ -414,30 +460,44 @@ CONTAINS
                                           fc1_in=scratch_fc1(j), fc2_in=scratch_fc2(k), &
                                           dfc1dr_in=scratch_dfc1(j), dfc2dr_in=scratch_dfc2(k), &
                                           dr1dx_in=scratch_dr1dx(:, j), dr2dx_in=scratch_dr2dx(:, k))
-                        !loop over associated sym fncts
-                        DO sf = 1, sg%n_symf
+                        DO sf = 1, n_symf_s
                            m = off + sg%symf(sf)
-                           ! update forces into dsymdxy
                            DO l = 1, 3
-                              dsymdxyz(m, l, i) = dsymdxyz(m, l, i) &
-                                                  + force3tmp(l, 1, sf)
-                              dsymdxyz(m, l, jj) = dsymdxyz(m, l, jj) &
-                                                   + force3tmp(l, 2, sf)
-                              dsymdxyz(m, l, kk) = dsymdxyz(m, l, kk) &
-                                                   + force3tmp(l, 3, sf)
+                              local_fi(l, sf) = local_fi(l, sf) + force3tmp(l, 1, sf)
+                              dsymdxyz(m, l, jj) = dsymdxyz(m, l, jj) + force3tmp(l, 2, sf)
+                              dsymdxyz(m, l, kk) = dsymdxyz(m, l, kk) + force3tmp(l, 3, sf)
                            END DO
                            IF (PRESENT(stress)) THEN
                               DO l = 1, 3
-                                 stress(:, l, m) = stress(:, l, m) - rvect1(:)*force3tmp(l, 2, sf)
-                                 stress(:, l, m) = stress(:, l, m) - rvect2(:)*force3tmp(l, 3, sf)
+                                 local_stress(1, l, sf) = local_stress(1, l, sf) &
+                                    - rvect1(1)*force3tmp(l, 2, sf) - rvect2(1)*force3tmp(l, 3, sf)
+                                 local_stress(2, l, sf) = local_stress(2, l, sf) &
+                                    - rvect1(2)*force3tmp(l, 2, sf) - rvect2(2)*force3tmp(l, 3, sf)
+                                 local_stress(3, l, sf) = local_stress(3, l, sf) &
+                                    - rvect1(3)*force3tmp(l, 2, sf) - rvect2(3)*force3tmp(l, 3, sf)
                               END DO
                            END IF
-                           nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + symtmp(sf)
+                           local_y(sf) = local_y(sf) + symtmp(sf)
                         END DO
                      END IF
                   END DO
                END DO
             END IF
+            ! Single reduction: scatter centre-i locals into the m-indexed shared arrays.
+            DO sf = 1, n_symf_s
+               m = off + sg%symf(sf)
+               DO l = 1, 3
+                  dsymdxyz(m, l, i) = dsymdxyz(m, l, i) + local_fi(l, sf)
+               END DO
+               IF (PRESENT(stress)) THEN
+                  DO l = 1, 3
+                     stress(1, l, m) = stress(1, l, m) + local_stress(1, l, sf)
+                     stress(2, l, m) = stress(2, l, m) + local_stress(2, l, sf)
+                     stress(3, l, m) = stress(3, l, m) + local_stress(3, l, sf)
+                  END DO
+               END IF
+               nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + local_y(sf)
+            END DO
             END ASSOCIATE
             NULLIFY(symtmp)
             NULLIFY(force3tmp)
@@ -448,25 +508,30 @@ CONTAINS
          !loop over radial sym fnct grps
          CALL timeset('nnp_acsf_radial', handle_sf)
          DO s = 1, nnp%rad(ind)%n_symfgrp
-            IF (.NOT. ALLOCATED(scratch_sym)) THEN
-               ALLOCATE(scratch_sym(nnp%rad(ind)%symfgrp(s)%n_symf))
-               scratch_max_sym = SIZE(scratch_sym)
-            ELSE IF (scratch_max_sym < nnp%rad(ind)%symfgrp(s)%n_symf) THEN
-               DEALLOCATE(scratch_sym)
-               ALLOCATE(scratch_sym(nnp%rad(ind)%symfgrp(s)%n_symf))
-               scratch_max_sym = SIZE(scratch_sym)
+            n_symf_s = nnp%rad(ind)%symfgrp(s)%n_symf
+            IF (.NOT. ALLOCATED(scratch_sym) .OR. .NOT. ALLOCATED(local_y) .OR. &
+                scratch_max_sym < n_symf_s) THEN
+               IF (ALLOCATED(scratch_sym)) DEALLOCATE(scratch_sym)
+               IF (ALLOCATED(local_y)) DEALLOCATE(local_y)
+               ALLOCATE(scratch_sym(n_symf_s))
+               ALLOCATE(local_y(n_symf_s))
+               scratch_max_sym = n_symf_s
             END IF
             ASSOCIATE (sg => nnp%rad(ind)%symfgrp(s))
-            symtmp => scratch_sym(1:sg%n_symf)
+            symtmp => scratch_sym(1:n_symf_s)
+            local_y(1:n_symf_s) = 0.0_dp
             !loop over associated neighbors
             DO j = 1, neighbor%n_rad(s)
                rvect1 = neighbor%dist_rad(1:3, j, s)
                r1 = neighbor%dist_rad(4, j, s)
                CALL nnp_calc_rad(nnp, ind, s, rvect1, r1, symtmp)
-               DO sf = 1, sg%n_symf
-                  m = sg%symf(sf)
-                  nnp%rad(ind)%y(m) = nnp%rad(ind)%y(m) + symtmp(sf)
+               DO sf = 1, n_symf_s
+                  local_y(sf) = local_y(sf) + symtmp(sf)
                END DO
+            END DO
+            DO sf = 1, n_symf_s
+               m = sg%symf(sf)
+               nnp%rad(ind)%y(m) = nnp%rad(ind)%y(m) + local_y(sf)
             END DO
             END ASSOCIATE
             NULLIFY(symtmp)
@@ -476,15 +541,17 @@ CONTAINS
          CALL timeset('nnp_acsf_angular', handle_sf)
          off = nnp%n_rad(ind)
          DO s = 1, nnp%ang(ind)%n_symfgrp
-            IF (.NOT. ALLOCATED(scratch_sym)) THEN
-               ALLOCATE(scratch_sym(nnp%ang(ind)%symfgrp(s)%n_symf))
-               scratch_max_sym = SIZE(scratch_sym)
-            ELSE IF (scratch_max_sym < nnp%ang(ind)%symfgrp(s)%n_symf) THEN
-               DEALLOCATE(scratch_sym)
-               ALLOCATE(scratch_sym(nnp%ang(ind)%symfgrp(s)%n_symf))
-               scratch_max_sym = SIZE(scratch_sym)
+            n_symf_s = nnp%ang(ind)%symfgrp(s)%n_symf
+            IF (.NOT. ALLOCATED(scratch_sym) .OR. .NOT. ALLOCATED(local_y) .OR. &
+                scratch_max_sym < n_symf_s) THEN
+               IF (ALLOCATED(scratch_sym)) DEALLOCATE(scratch_sym)
+               IF (ALLOCATED(local_y)) DEALLOCATE(local_y)
+               ALLOCATE(scratch_sym(n_symf_s))
+               ALLOCATE(local_y(n_symf_s))
+               scratch_max_sym = n_symf_s
             END IF
-            symtmp => scratch_sym(1:nnp%ang(ind)%symfgrp(s)%n_symf)
+            symtmp => scratch_sym(1:n_symf_s)
+            local_y(1:n_symf_s) = 0.0_dp
             ASSOCIATE (sg => nnp%ang(ind)%symfgrp(s))
             ! Hoist f_c(r1) and f_c(r2) out of the k-loop
             fc_needed = neighbor%n_ang1(s)
@@ -537,9 +604,8 @@ CONTAINS
                         r3 = SQRT(r3sq)
                         CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, r1, r2, r3, symtmp, &
                                           fc1_in=scratch_fc1(j), fc2_in=scratch_fc1(k))
-                        DO sf = 1, sg%n_symf
-                           m = off + sg%symf(sf)
-                           nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + symtmp(sf)
+                        DO sf = 1, n_symf_s
+                           local_y(sf) = local_y(sf) + symtmp(sf)
                         END DO
                      END IF
                   END DO
@@ -557,15 +623,18 @@ CONTAINS
                         r3 = SQRT(r3sq)
                         CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, r1, r2, r3, symtmp, &
                                           fc1_in=scratch_fc1(j), fc2_in=scratch_fc2(k))
-                        !loop over associated sym fncts
-                        DO sf = 1, sg%n_symf
-                           m = off + sg%symf(sf)
-                           nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + symtmp(sf)
+                        DO sf = 1, n_symf_s
+                           local_y(sf) = local_y(sf) + symtmp(sf)
                         END DO
                      END IF
                   END DO
                END DO
             END IF
+            ! Single reduction into the m-indexed shared array.
+            DO sf = 1, n_symf_s
+               m = off + sg%symf(sf)
+               nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + local_y(sf)
+            END DO
             END ASSOCIATE
             NULLIFY(symtmp)
          END DO
