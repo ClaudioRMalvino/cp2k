@@ -182,17 +182,15 @@ MODULE nnp_environment_types
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: loc_max
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: loc_av
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: sigma
-      ! Pre-computed scaling factors (filled once at init in nnp_init_model from the
-      ! parsed scaling.data file).  scale_factor = (scmax - scmin) / (loc_max - loc_min);
-      ! inv_sigma_factor = (scmax - scmin) / sigma.  Used by nnp_scale_acsf to replace
-      ! a per-(centre, sym, neighbour) divide with a single multiply.
+      ! Reciprocal scaling factors, set once in nnp_init_model from scaling.data.
+      ! Used by nnp_scale_acsf to turn a per-symmetry-function divide into a multiply.
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: scale_factor
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: inv_sigma_factor
       CHARACTER(len=2), ALLOCATABLE, DIMENSION(:)         :: ele
       INTEGER, ALLOCATABLE, DIMENSION(:)                  :: nuc_ele
       INTEGER                                             :: n_symfgrp = -1
       TYPE(nnp_symfgrp_type), DIMENSION(:), ALLOCATABLE   :: symfgrp
-      ! Per-centre map from neighbour element index -> list of radial groups
+      ! Neighbour-element -> radial-group index map.
       INTEGER, ALLOCATABLE, DIMENSION(:)                  :: ele_grp_count
       INTEGER, ALLOCATABLE, DIMENSION(:, : )              :: ele_grp_list
    END TYPE nnp_acsf_rad_type
@@ -218,11 +216,9 @@ MODULE nnp_environment_types
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: funccut
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: eta
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: zeta
-      ! Precomputed companions to zeta (set in nnp_init_acsf_groups, after sort):
-      !   zeta_int(:)    = NINT(zeta)
-      !   zeta_is_int(:) = .TRUE. when zeta is integer-valued (always true for typical NNPs;
-      !                    integer power is much faster than the libm pow() call required for
-      !                    real exponents).  Removes NINT + FP-equality check from the inner sf loop.
+      ! NINT(zeta) and its is-integer flag, set in nnp_init_acsf_groups after
+      ! the symmetry-function sort so the angular kernel can dispatch to an
+      ! integer power without a per-iteration NINT and FP-equality check.
       INTEGER, ALLOCATABLE, DIMENSION(:)                  :: zeta_int
       LOGICAL, ALLOCATABLE, DIMENSION(:)                  :: zeta_is_int
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: prefzeta
@@ -231,7 +227,7 @@ MODULE nnp_environment_types
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: loc_max
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: loc_av
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: sigma
-      ! Pre-computed scaling factors (see nnp_acsf_rad_type for definitions).
+      ! See nnp_acsf_rad_type for the scaling-factor convention.
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: scale_factor
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: inv_sigma_factor
       CHARACTER(len=2), ALLOCATABLE, DIMENSION(:)         :: ele1
@@ -240,7 +236,7 @@ MODULE nnp_environment_types
       INTEGER, ALLOCATABLE, DIMENSION(:)                  :: nuc_ele2
       INTEGER                                             :: n_symfgrp = -1
       TYPE(nnp_symfgrp_type), DIMENSION(:), ALLOCATABLE   :: symfgrp
-      ! Per-centre maps from neighbour element index -> list of angular groups
+      ! Neighbour-element -> angular-group index maps (one per pair slot).
       INTEGER, ALLOCATABLE, DIMENSION(:)                  :: ele1_grp_count
       INTEGER, ALLOCATABLE, DIMENSION(:, : )              :: ele1_grp_list
       INTEGER, ALLOCATABLE, DIMENSION(:)                  :: ele2_grp_count

@@ -121,9 +121,9 @@ CONTAINS
          END DO
       END DO
 
-      ! Parallelisation: compute each rank's atom slice analytically.
-      ! mecalc(p) = base+1 for p < remainder, base otherwise.  istart is the prefix sum.
-      ! No allgather needed — the formula is deterministic given num_atoms, num_pe, mepos.
+      ! Per-rank atom slice from a closed-form distribution: ranks below
+      ! n_remainder get one extra atom.  Avoids the allgather present in the
+      ! reference implementation.
       n_base = nnp%num_atoms/logger%para_env%num_pe
       n_remainder = MOD(nnp%num_atoms, logger%para_env%num_pe)
       IF (logger%para_env%mepos < n_remainder) THEN
@@ -133,26 +133,25 @@ CONTAINS
          mecalc = n_base
          istart = 1 + n_remainder*(n_base + 1) + (logger%para_env%mepos - n_remainder)*n_base
       END IF
-      
+
       ! reset extrapolation status
       nnp%output_expol = .FALSE.
 
-      ! Prepare cell-list cache once per force eval (Verlet-skin amortised rebuild).
-      ! Subsequent nnp_compute_neighbors calls then walk only the 27 bins around each centre atom.
+      ! Build (or refresh) the cell list once per force evaluation; the
+      ! subsequent nnp_compute_neighbors calls walk only the bins around the
+      ! centre atom.
       CALL nnp_prepare_cell_list_cache(nnp)
 
-      ! Hoist scratch allocations out of the per-centre loop:
-      !   * dsymdxyz is sized to MAX(n_nodes(1)) over element types so the same buffer serves
-      !     every centre regardless of element. Its O(num_atoms) third dimension is touched only
-      !     for atoms in the active list — we zero those entries selectively after use.
-      !   * active_atoms / active_flag track the centre + every neighbour the cell-list walk
-      !     touched, so the per-centre force-accumulation walks ~k atoms instead of all N.
+      ! Persistent per-rank scratch.  dsymdxyz is dimensioned to the largest
+      ! n_nodes(1) across element types so a single buffer serves every centre;
+      ! active_atoms / active_flag carry the set of neighbours that the centre
+      ! actually touched, restricting the force-accumulation loop to that set.
       IF (calc_forces) THEN
          max_nsym = 0
          DO ie = 1, nnp%n_ele
             IF (nnp%arc(ie)%n_nodes(1) > max_nsym) max_nsym = nnp%arc(ie)%n_nodes(1)
          END DO
-         ! Only allocate if it hasn't been allocated yet, or if the system grew
+         ! Reallocate only on first call or when the system size changes.
          IF (.NOT. ALLOCATED(dsymdxyz) .OR. SIZE(dsymdxyz, 3) /= nnp%num_atoms) THEN
             IF (ALLOCATED(dsymdxyz)) THEN
                DEALLOCATE (dsymdxyz, active_atoms, active_flag, denergydsym)
@@ -199,8 +198,8 @@ CONTAINS
             nnp%atomic_energy(i, i_com) = nnp%arc(ind)%layer(nnp%n_layer)%node(1) + &
                                           nnp%atom_energies(ind)
 
-            ! predict forces — restrict the accumulation to atoms touched by this centre's
-            ! neighbour walk (active_atoms).  Drops O(num_atoms) inner loop to O(n_active).
+            ! predict forces; the inner loop is restricted to the active set
+            ! built by nnp_calc_acsf, so the cost is O(n_active) per centre.
             IF (calc_forces) THEN
                denergydsym(1:nnp%arc(ind)%n_nodes(1)) = 0.0_dp
                CALL nnp_gradients(nnp%arc(ind), nnp, i_com, denergydsym)
@@ -221,8 +220,8 @@ CONTAINS
             END IF
          END DO
 
-         ! Selectively zero the dsymdxyz slice we just used and clear active_flag, so the
-         ! buffer is clean for the next centre atom.  Cost is O(n_active) per centre.
+         ! Zero only the slices of dsymdxyz that this centre touched and
+         ! reset active_flag for the next centre (O(n_active) work).
          IF (calc_forces) THEN
             DO idx = 1, n_active
                k = active_atoms(idx)
