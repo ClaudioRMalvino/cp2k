@@ -28,12 +28,12 @@ MODULE splines_methods
 
    PUBLIC :: init_splinexy ! allocates x and y vectors for splines
    PUBLIC :: init_spline ! generate table for spline (allocates y2)
-   PUBLIC :: init_hermite_spline ! init Hermite cubic spline (stores h*dydx in y2)
+   PUBLIC :: init_hermite_spline
    PUBLIC :: potential_s ! return value of spline and 1. derivative
    ! without checks (fast routine for pair_potential)
    PUBLIC :: spline_value ! return value of spline and 1. derivative
    ! without check (without assumption of 1/x^2 grid)
-   PUBLIC :: hermite_spline_value ! evaluate Hermite cubic spline (and optionally its derivative)
+   PUBLIC :: hermite_spline_value
 
 CONTAINS
 
@@ -244,21 +244,21 @@ CONTAINS
    END FUNCTION spline_value
 
 ! **************************************************************************************************
-!> \brief Initialise a Hermite cubic spline on a uniform grid.
-!>      Requires spl%y(1:n) filled with function values, spl%x1 set, and spl%n set
-!>      (e.g. via init_splinexy).  Builds Horner-form polynomial coefficients per
-!>      interval into spl%coef(4, n-1) for use by hermite_spline_value.
+!> \brief Initialise a Hermite cubic spline on a uniform grid by precomputing
+!>        the per-interval Horner coefficients in spl%coef(4, n-1).
 !>
-!>      For each interval [x_i, x_{i+1}] with t = (x - x_i)*invh ∈ [0, 1]:
-!>          p(t) = a_0 + a_1·t + a_2·t² + a_3·t³
-!>      with a_0 = y_i, a_1 = h·y'_i,
-!>           a_2 = -3·y_i + 3·y_{i+1} - 2·h·y'_i - h·y'_{i+1},
-!>           a_3 =  2·y_i - 2·y_{i+1} +   h·y'_i + h·y'_{i+1}.
-!>      This is the same Hermite cubic as the basis form, just pre-collected so the
-!>      evaluator does ~3 MUL + 3 ADD per call instead of ~22 MUL + 12 ADD.
-!> \param spl  spline_data structure with y and n already populated
-!> \param dx   uniform grid spacing
-!> \param dydx first derivatives y'(x_i) at each of the n grid points
+!>        Requires spl%y(1:n), spl%x1, and spl%n to be set on entry (e.g. via
+!>        init_splinexy).  For each interval [x_i, x_{i+1}] with
+!>        t = (x - x_i)*invh in [0, 1]:
+!>            p(t) = a_0 + a_1*t + a_2*t**2 + a_3*t**3
+!>        with a_0 = y_i, a_1 = h*y'_i,
+!>             a_2 = -3*y_i + 3*y_{i+1} - 2*h*y'_i - h*y'_{i+1},
+!>             a_3 =  2*y_i - 2*y_{i+1} +   h*y'_i + h*y'_{i+1}.
+!> \param spl   spline_data structure with y and n already populated
+!> \param dx    uniform grid spacing
+!> \param dydx  first derivatives y'(x_i) at each of the n grid points
+!> \date   2026-05-12
+!> \author Claudio Malagrino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    SUBROUTINE init_hermite_spline(spl, dx, dydx)
 
@@ -295,20 +295,18 @@ CONTAINS
    END SUBROUTINE init_hermite_spline
 
 ! **************************************************************************************************
-!> \brief Evaluate a Hermite cubic spline at xx, returning the interpolated value.
-!>      Optionally returns the first derivative y1 = d(val)/d(xx).
-!>      No out-of-range checks: caller must ensure xx in [spl%x1, spl%xn].
-!>      spl%coef(:, i) must hold the Horner polynomial coefficients as set by
-!>      init_hermite_spline.
+!> \brief Evaluate a Hermite cubic spline at xx in Horner form, returning the
+!>        interpolated value and optionally the first derivative.
 !>
-!>      Horner form: 3 MUL + 3 ADD for the value, 2 MUL + 3 ADD for the derivative.
-!>      Mathematically identical to the basis-function form; the per-evaluation
-!>      cost is roughly 4× lower because the polynomial coefficients are
-!>      pre-collected once at init.
+!>        Caller must ensure xx lies in [spl%x1, spl%xn]; the index is clamped
+!>        but the polynomial extrapolates linearly outside the tabulated range.
+!>        spl%coef(:, i) must have been populated by init_hermite_spline.
 !> \param spl  Hermite spline data
 !> \param xx   evaluation point
 !> \param y1   (OPTIONAL) first derivative at xx
 !> \return     interpolated function value
+!> \date   2026-05-12
+!> \author Claudio Malagrino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    FUNCTION hermite_spline_value(spl, xx, y1) RESULT(val)
 

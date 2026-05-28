@@ -693,9 +693,8 @@ CONTAINS
          CALL parser_release(parser)
       END IF
 
-      ! Pre-compute scaling factors used by nnp_scale_acsf so the per-(centre, neighbour)
-      ! divides become a single multiply.  scmax/scmin and loc_max/loc_min/sigma are all
-      ! now known and frozen for the run.
+      ! Precompute reciprocal scaling factors for nnp_scale_acsf; loc_max,
+      ! loc_min and sigma are frozen for the run by this point.
       IF (nnp_env%scale_acsf .OR. nnp_env%scale_sigma_acsf) THEN
          DO i = 1, nnp_env%n_ele
             IF (nnp_env%scale_acsf) THEN

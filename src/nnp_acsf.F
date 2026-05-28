@@ -50,14 +50,14 @@ MODULE nnp_acsf
              nnp_write_acsf
 
 ! **************************************************************************************************
-!> \brief Module-level cache for the pre-expanded-image cell list used by the O(N) neighbour query.
-!>        Each (atom j, integer PBC shift (tx,ty,tz)) becomes one image entry; image positions are
-!>        stored explicitly so the inner query loop does no pbc() calls.  Grid is coarse
-!>        (bin_width ~ list_cutoff, bin_span = 1) so each centre atom walks 27 bins.  Rebuild is
-!>        triggered only by Verlet-skin violation (any atom moved > 0.5*skin) or by changes to
-!>        num_atoms / cell vectors / cutoff.
-!> \author Claudio Malvino
+!> \brief Pre-expanded-image cell list used by the O(N) neighbour query.
+!>        Each (atom j, integer PBC shift) is stored as an explicit image so
+!>        the inner query loop does no pbc() calls.  Bin width is set so that
+!>        each centre atom walks a 3x3x3 block of bins.  Rebuilds are
+!>        triggered by Verlet-skin violation or by changes to num_atoms,
+!>        cell vectors, or cutoff.
 !> \date   2026-04-24
+!> \author Claudio Malagrino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    TYPE, PRIVATE :: nnp_cell_list_cache_type
       LOGICAL                              :: initialized   = .FALSE.
@@ -77,56 +77,50 @@ MODULE nnp_acsf
       REAL(KIND=dp), DIMENSION(3)          :: bin_width     = 0.0_dp
       REAL(KIND=dp), DIMENSION(3, 3)       :: hmat          = 0.0_dp
       REAL(KIND=dp), DIMENSION(3, 3)       :: h_inv         = 0.0_dp
-      ! Primary (PBC-wrapped) atom positions — refreshed every prepare call
-      REAL(KIND=dp), ALLOCATABLE           :: coord_primary(:, :)         ! (3, num_atoms)
-      ! Snapshot of coord_primary at the last rebuild (Verlet reference)
-      REAL(KIND=dp), ALLOCATABLE           :: ref_coord_primary(:, :)     ! (3, num_atoms)
-      ! Image table: one entry per (atom j, integer PBC shift) pair
-      INTEGER, ALLOCATABLE                 :: image_atom(:)               ! (n_images)
-      INTEGER, ALLOCATABLE                 :: image_shift(:, :)           ! (3, n_images)
-      REAL(KIND=dp), ALLOCATABLE           :: image_translation(:, :)     ! (3, n_images)
-      ! Linked-list cell grid: head(n_cells) → first image in bin, next(n_images) chains images
-      INTEGER, ALLOCATABLE                 :: head(:)                     ! (n_cells)
-      INTEGER, ALLOCATABLE                 :: next(:)                     ! (n_images)
+      ! PBC-wrapped primary positions, refreshed every prepare call.
+      REAL(KIND=dp), ALLOCATABLE           :: coord_primary(:, :)
+      ! Snapshot of coord_primary at the last rebuild (Verlet reference).
+      REAL(KIND=dp), ALLOCATABLE           :: ref_coord_primary(:, :)
+      ! Image table: one entry per (atom j, integer PBC shift) pair.
+      INTEGER, ALLOCATABLE                 :: image_atom(:)
+      INTEGER, ALLOCATABLE                 :: image_shift(:, :)
+      REAL(KIND=dp), ALLOCATABLE           :: image_translation(:, :)
+      ! Linked-list cell grid.
+      INTEGER, ALLOCATABLE                 :: head(:)
+      INTEGER, ALLOCATABLE                 :: next(:)
    END TYPE nnp_cell_list_cache_type
 
-   ! Module-level Hermite cubic splines built once at first call to nnp_init_acsf_groups.
-   ! spl_exp covers EXP on [-50, 0]; spl_cos covers COS on [0, pi]; spl_tanh covers TANH on [0, 1].
-   ! y2 stores h*y'(x_i) as required by hermite_spline_value (splines_methods.F).
+   ! Hermite cubic splines built once at first call to nnp_init_acsf_groups.
+   ! spl_exp on [-50, 0], spl_cos on [0, pi], spl_tanh on [0, 1].
    TYPE(spline_data_type), SAVE, PRIVATE :: spl_exp, spl_cos, spl_tanh
    LOGICAL, SAVE, PRIVATE                :: spline_initialized = .FALSE.
    TYPE(nnp_cell_list_cache_type), SAVE, PRIVATE :: cell_list_cache
 
-   ! Persistent per-centre neighbour buffer, reused across all atoms in a force eval.
-   ! Without this each centre atom would do 9 ALLOCATEs sized in num_atoms — at ~6k atoms those
-   ! cross glibc's mmap threshold and become syscalls, giving O(N^2) malloc traffic per step.
-   ! Sized to the MAX (n_symfgrp_rad / n_symfgrp_ang) over element types so the same buffer
-   ! works for every centre regardless of which element it is.
+   ! Persistent per-centre neighbour buffer reused across atoms in a force
+   ! evaluation; sized to the largest (n_symfgrp_rad / n_symfgrp_ang) over
+   ! element types so the same buffer serves any centre.
    TYPE(nnp_neighbor_type), SAVE, PRIVATE, TARGET :: persistent_neighbor
    INTEGER, SAVE, PRIVATE                          :: persistent_n_capacity = -1
    INTEGER, SAVE, PRIVATE                          :: persistent_n_rad_grp = -1
    INTEGER, SAVE, PRIVATE                          :: persistent_n_ang_grp = -1
-   ! Module-level scratch buffers to avoid repeated allocate/deallocate in hot loops
+   ! Module-level scratch reused in the hot loops.
    INTEGER, SAVE, PRIVATE                          :: scratch_max_sym = -1
    REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_sym(:)
    REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_forcetmp(:,:)
    REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_force3tmp(:,:,:)
-   ! Local accumulators for centre-i force, stress, and y contributions, indexed by sf.
-   ! The inner (j,k) loops accumulate into these unit-stride arrays; a single reduction
-   ! pass after each symmetry-function group resolves m = sg%symf(sf) and scatters into
-   ! the m-indexed shared arrays.  Same pattern as feature/nnp-native-spline-omp, without
-   ! the !$OMP CRITICAL wrap (single thread per MPI rank here).
+   ! Local per-symmetry-function accumulators for the (j,k) loops.  A single
+   ! reduction pass after each symmetry-function group scatters them through
+   ! m = sg%symf(sf) into the shared m-indexed arrays.
    REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: local_y(:)
    REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: local_fi(:,:)
    REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: local_stress(:,:,:)
-   ! Pre-computed per-pair cutoff values and their dr-derivatives.
-   ! Hoists f_c(r1) and f_c(r2) out of the inner k-loop; fc3(r3) is still per-triplet.
-   ! scratch_dr1dx / scratch_dr2dx hold rvect/r unit vectors per neighbour, also k-loop invariant.
+   ! Per-neighbour cutoff value/derivative and unit vector, all invariant
+   ! over the inner k-loop of nnp_calc_ang.
    INTEGER, SAVE, PRIVATE                          :: scratch_max_fc = -1
    REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_fc1(:), scratch_dfc1(:)
    REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_fc2(:), scratch_dfc2(:)
-   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_dr1dx(:, :)  ! (3, n)
-   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_dr2dx(:, :)  ! (3, n)
+   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_dr1dx(:, :)
+   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_dr2dx(:, :)
 
 CONTAINS
 
@@ -165,23 +159,21 @@ CONTAINS
       !determine index of atom type
       ind = nnp%ele_ind(i)
 
-      ! Hoist invariants: cut_type is set once at init and never changes.  The compiler can't
-      ! prove this through the derived-type access on every loop iteration, so cache locally.
+      ! Cache cut_type locally; the compiler cannot prove the derived-type
+      ! field is loop-invariant.
       cut_type = nnp%cut_type
 
-      ! Reuse the module-level persistent neighbour buffer (sized once per force eval by
-      ! nnp_neighbor_ensure_persistent).  Only the counts are reset between centre atoms;
-      ! no allocations happen in the per-atom hot path.
+      ! Reuse the module-level neighbour buffer; only the counts are reset
+      ! between centres, so no allocations occur in the per-atom hot path.
       neighbor => persistent_neighbor
       neighbor%n_rad(:) = 0
       neighbor%n_ang1(:) = 0
       neighbor%n_ang2(:) = 0
       CALL nnp_compute_neighbors(nnp, neighbor, i)
 
-      ! Build active-atoms list: centre i + every distinct neighbour touched by the rad/ang
-      ! lists.  active_flag is the dedup map (caller resets touched entries to 0 between centres).
-      ! Restricts the O(num_atoms) dsymdxyz / force-accumulation loops to the actual neighbour
-      ! set — drops O(N^2) per force eval to O(N) at fixed density.
+      ! Build the active-atoms list (centre i plus every distinct neighbour
+      ! referenced by the rad/ang lists).  active_flag is the dedup map; the
+      ! caller resets touched entries to 0 between centres.
       IF (PRESENT(active_atoms) .AND. PRESENT(active_flag) .AND. PRESENT(n_active)) THEN
          n_active = 1
          active_atoms(1) = i
@@ -215,12 +207,8 @@ CONTAINS
             END DO
          END DO
 
-         ! Sort active_atoms(1:n_active) in ascending order so subsequent walks (especially
-         ! nnp_scale_acsf) hit dsymdxyz(:, :, k) in increasing k order — turns sparse-random
-         ! atom indices into prefetcher-friendly streaming and improves TLB locality.
-         ! In-place heap sort: O(n log n) worst case, zero allocations.  n_active is
-         ! geometrically bounded (cutoff sphere × density) but heap sort keeps the algorithm
-         ! asymptotically clean for arbitrary system sizes.
+         ! Sort ascending so downstream walks hit dsymdxyz(:, :, k) in
+         ! increasing k order; better prefetching and TLB locality.
          IF (n_active > 1) CALL nnp_sort_active_atoms(active_atoms, n_active)
       END IF
 
@@ -327,14 +315,12 @@ CONTAINS
             END IF
             symtmp => scratch_sym(1:n_symf_s)
             force3tmp => scratch_force3tmp(:, :, 1:n_symf_s)
-            ! Zero the centre-i accumulators before the (j,k) loop nests
+            ! Zero the centre-i accumulators before the (j, k) loop nest.
             local_y(1:n_symf_s) = 0.0_dp
             local_fi(:, 1:n_symf_s) = 0.0_dp
             IF (PRESENT(stress)) local_stress(:, :, 1:n_symf_s) = 0.0_dp
-            ! Hoist k-loop invariants out of the O(C^2) triple loop:
-            !   fc1, dfc1dr  (cutoff value + d/dr at r1)  — depend only on j
-            !   fc2, dfc2dr  (mixed-element case only)    — depend only on k
-            !   dr1dx, dr2dx (rvect/r unit vectors)       — depend only on j (or k)
+            ! Per-j cutoff value, derivative, and unit vector are invariant
+            ! over the inner k loop; precomputed once per group.
             ASSOCIATE (sg => nnp%ang(ind)%symfgrp(s))
                fc_needed = neighbor%n_ang1(s)
                IF (sg%ele(1) /= sg%ele(2)) fc_needed = MAX(fc_needed, neighbor%n_ang2(s))
@@ -553,7 +539,7 @@ CONTAINS
             symtmp => scratch_sym(1:n_symf_s)
             local_y(1:n_symf_s) = 0.0_dp
             ASSOCIATE (sg => nnp%ang(ind)%symfgrp(s))
-            ! Hoist f_c(r1) and f_c(r2) out of the k-loop
+            ! Per-j cutoff value, invariant over the inner k loop.
             fc_needed = neighbor%n_ang1(s)
             IF (sg%ele(1) /= sg%ele(2)) &
                fc_needed = MAX(fc_needed, neighbor%n_ang2(s))
@@ -662,7 +648,7 @@ CONTAINS
          CALL nnp_scale_acsf(nnp, ind)
       END IF
 
-      ! Persistent buffer — no release here; freed at program end via SAVE finalisation.
+      ! Module-level buffers are SAVE; no per-call release.
       CALL timestop(handle)
 
    END SUBROUTINE nnp_calc_acsf
@@ -729,10 +715,9 @@ CONTAINS
 
       INTEGER                                            :: idx, j, k, off
 
-      ! Build the input layer (node) array from the centre's symmetry function values.
-      ! Small loop (n_rad + n_ang elements) — kept serial.  Sub-expressions like
-      ! (scmax-scmin)/(loc_max-loc_min) are now folded into nnp%*%scale_factor and
-      ! nnp%*%inv_sigma_factor, filled once at init in nnp_init_model.
+      ! Build the input layer from the centre's symmetry-function values.
+      ! Reciprocal scale factors are precomputed in nnp_init_model, so the
+      ! per-symmetry-function divides become multiplies.
       IF (nnp%center_acsf) THEN
          DO j = 1, nnp%n_rad(ind)
             nnp%arc(ind)%layer(1)%node(j) = &
@@ -789,10 +774,8 @@ CONTAINS
          END DO
       END IF
 
-      ! dsymdxyz scaling: walk only the active atoms when the caller provided them
-      ! (drops O(num_atoms) per centre to O(n_active) ≈ O(1) at fixed density).
-      ! Each (idx, j) pair writes a unique dsymdxyz(j, :, k) slot; the active_atoms
-      ! array has been sorted ascending so k strides increasing — prefetcher-friendly.
+      ! Scale dsymdxyz only over the active set when the caller provided one;
+      ! active_atoms is sorted ascending so writes stride forward in k.
       IF (PRESENT(dsymdxyz)) THEN
          IF (nnp%scale_acsf) THEN
             IF (PRESENT(active_atoms) .AND. PRESENT(n_active)) THEN
@@ -908,8 +891,7 @@ CONTAINS
       fcut = 0.0_dp
       dfcutdr = 0.0_dp
 
-      ! Hoist invariants: cut_type is constant for the run; the symfgrp ASSOCIATE alias collapses
-      ! the chain of derived-type field accesses inside hot inner loops.
+      ! Cache cut_type and alias the symfgrp record locally.
       cut_type = nnp%cut_type
       ASSOCIATE (sg => nnp%rad(ind)%symfgrp(s))
 
@@ -936,7 +918,7 @@ CONTAINS
          CPABORT("NNP| Cutoff function unknown")
       END SELECT
 
-      ! 1 division -> 3 multiplies (division is ~6x slower on x86)
+      ! 1/r hoisted out of the sf loop; the three components reuse it.
       IF (PRESENT(force)) THEN
          rinv = 1.0_dp/r
          drdx(1) = rvect(1)*rinv
@@ -952,7 +934,8 @@ CONTAINS
 
          tmp = -eta*(r - rs)**2
 
-         ! Use spline value directly in the EXP chain rule (O(h^4) accuracy vs O(h^3) derivative).
+         ! Reuse the spline value in the chain rule (d/dx exp(x) = exp(x));
+         ! more accurate than evaluating the spline derivative separately.
          IF (tmp <= spl_exp%x1) THEN
             sym(sf) = 0.0_dp
             IF (PRESENT(force)) dsymdr = 0.0_dp
@@ -1123,14 +1106,14 @@ CONTAINS
             r2inv = 1.0_dp/r2
             dr2dx(1) = rvect2(1)*r2inv; dr2dx(2) = rvect2(2)*r2inv; dr2dx(3) = rvect2(3)*r2inv
          END IF
-         ! r3 is per-(j,k) — always compute the unit vector here.
+         ! r3 unit vector is per-(j, k); always recomputed here.
          r3inv = 1.0_dp/r3
          dr3dx(1) = rvect3(1)*r3inv; dr3dx(2) = rvect3(2)*r3inv; dr3dx(3) = rvect3(3)*r3inv
       END IF
 
-      ! Hoist invariants out of the sf loop:
-      !  * r_sum_sq = r1^2 + r2^2 + r3^2 (the EXP argument is -eta*r_sum_sq, only eta varies per sf)
-      !  * g_sq_inv = 1/g^2 (used in dangular/dr; g = -2 r1 r2 doesn't depend on sf)
+      ! Loop-invariants for the symmetry-function loop below: r_sum_sq enters
+      ! the EXP argument as -eta*r_sum_sq (only eta varies per sf), and
+      ! g_sq_inv enters dangular/dr.
       r_sum_sq = rsqr1 + rsqr2 + rsqr3
       g_sq_inv = 1.0_dp/(g*g)
 
@@ -1152,11 +1135,9 @@ CONTAINS
             CYCLE
          END IF
 
-         ! Calculate angular symmetry function.  zeta_is_int / zeta_int are precomputed once
-         ! at init from the (post-sort) zeta values; no NINT or FP-equality test in the hot loop.
-         ! SELECT CASE on zeta_int(m) expands the common Behler-Parrinello values
-         ! {1, 2, 4, 8, 16} (exponents {0, 1, 3, 7, 15}) into inlined multiplications,
-         ! eliminating the __powr8i4 libm dispatch flagged by MAQAO CQA.
+         ! Angular symmetry function.  zeta_int / zeta_is_int are precomputed
+         ! once at init.  SELECT CASE inlines the common Behler-Parrinello
+         ! exponents {1, 3, 7, 15} as plain multiplies, avoiding __powr8i4.
          IF (a%zeta_is_int(m)) THEN
             SELECT CASE (a%zeta_int(m))
             CASE (1)
@@ -1182,9 +1163,8 @@ CONTAINS
          END IF
          angular = tmpzeta*tmp
 
-         ! Spline Evaluation for EXP.  Use symtmp (~EXP value) for the chain rule below
-         ! instead of evaluating the spline derivative separately — same answer, slightly
-         ! more accurate (O(h^4) value vs O(h^3) formal derivative).
+         ! Spline evaluation of EXP.  The chain rule below reuses symtmp
+         ! (d/dx exp(x) = exp(x)), so no second spline call is needed.
          tmp = -eta*r_sum_sq
          IF (tmp <= spl_exp%x1) THEN
             symtmp = 0.0_dp
@@ -1840,11 +1820,14 @@ CONTAINS
    END SUBROUTINE nnp_write_acsf
 
 ! **************************************************************************************************
-!> \brief Build neighbour list for centre atom i by walking only the 27 bins around its current bin
-!>        in the pre-expanded-image cell list.  O(k) per atom where k is the average per-bin image
-!>        occupancy — independent of total system size.  No pbc() call in the inner loop: each image
-!>        carries an explicit translation = hmat·shift, so the displacement is a direct subtraction.
-!>        cell_list_cache must be populated by nnp_prepare_cell_list_cache before any call here.
+!> \brief Build the neighbour list for centre atom i by walking the bins
+!>        around its current bin in the pre-expanded-image cell list.
+!>
+!>        Cost is O(k) per atom where k is the average per-bin image
+!>        occupancy.  No pbc() call in the inner loop: each image carries an
+!>        explicit translation, so the displacement is a direct subtraction.
+!>        cell_list_cache must be populated by nnp_prepare_cell_list_cache
+!>        beforehand.
 !> \param nnp ...
 !> \param neighbor ...
 !> \param i ...
@@ -1867,7 +1850,7 @@ CONTAINS
       max_cut_sq = nnp%max_cut*nnp%max_cut
 
       ASSOCIATE (cl => cell_list_cache)
-         ! Hoist centre coordinates as scalars (no array temporaries inside the bin walk)
+         ! Scalar centre coordinates so the inner walk has no array temporaries.
          cx = cl%coord_primary(1, i)
          cy = cl%coord_primary(2, i)
          cz = cl%coord_primary(3, i)
@@ -1880,27 +1863,24 @@ CONTAINS
             img = cl%head(cell_idx)
             DO WHILE (img > 0)
                j = cl%image_atom(img)
-               ! Skip self-image (j == i AND shift == 0); other periodic images of i are valid.
+               ! Skip the self-image; other periodic images of i are valid.
                IF (j == i .AND. cl%image_shift(1, img) == 0 .AND. &
                    cl%image_shift(2, img) == 0 .AND. cl%image_shift(3, img) == 0) THEN
                   img = cl%next(img)
                   CYCLE
                END IF
-               ! Manual scalar dr (avoid Fortran array temporaries)
                drx = cx - (cl%coord_primary(1, j) + cl%image_translation(1, img))
                dry = cy - (cl%coord_primary(2, j) + cl%image_translation(2, img))
                drz = cz - (cl%coord_primary(3, j) + cl%image_translation(3, img))
                r2 = drx*drx + dry*dry + drz*drz
-               ! Cheap reject before SQRT: anything past max_cut can't enter any group's list.
+               ! Reject against max_cut before any SQRT.
                IF (r2 >= max_cut_sq) THEN
                   img = cl%next(img)
                   CYCLE
                END IF
-               ! Hoist neighbour element type once (saves repeated indirect loads in the cmp).
                j_type = nnp%ele_ind(j)
-               ! lazy sqrt: compute norm only if at least one group accepts this image
+               ! Defer SQRT until at least one group accepts this image.
                norm = -1.0_dp
-               ! Identical classification logic to the original double loop, scalar fill.
                DO s = 1, nnp%rad(ind)%n_symfgrp
                   IF (j_type == nnp%rad(ind)%symfgrp(s)%ele_ind(1)) THEN
                      IF (r2 < nnp%rad(ind)%symfgrp(s)%cutoff_sq) THEN
@@ -1949,14 +1929,16 @@ CONTAINS
    END SUBROUTINE nnp_compute_neighbors
 
 ! **************************************************************************************************
-!> \brief Prepare (lazily rebuild) the module-level cell-list cache for this force evaluation.
-!>        Must be called once per force eval (from nnp_calc_energy_force) before the per-atom
-!>        nnp_compute_neighbors loop.  Cheap path is O(N): refresh PBC-wrapped coords and check the
-!>        Verlet skin.  Full rebuild (O(N*(2p+1)^3)) is triggered only when an atom has moved more
-!>        than 0.5*skin or when num_atoms / cell vectors / cutoff have changed.
+!> \brief Lazily rebuild the module-level cell-list cache.
+!>
+!>        Called once per force evaluation, before the per-atom
+!>        nnp_compute_neighbors loop.  The cheap path is O(N): refresh
+!>        PBC-wrapped coords and check the Verlet skin.  A full O(N*(2p+1)^3)
+!>        rebuild is triggered only when the maximum atomic displacement
+!>        exceeds 0.5*skin or when num_atoms / cell vectors / cutoff change.
 !> \param nnp ...
 !> \date   2026-04-24
-!> \author Claudio Malvino
+!> \author Claudio Malagrino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    SUBROUTINE nnp_prepare_cell_list_cache(nnp)
       TYPE(nnp_type), INTENT(INOUT), POINTER             :: nnp
@@ -1977,16 +1959,14 @@ CONTAINS
       NULLIFY (cell)
       CALL nnp_env_get(nnp_env=nnp, cell=cell)
 
-      ! Ensure the persistent per-centre neighbour buffer is allocated to max capacity.
-      ! Does nothing on subsequent steps if shape is unchanged; without this each centre
-      ! atom would do 9 size-N ALLOCATEs in nnp_calc_acsf, giving O(N^2) malloc traffic.
+      ! Size the persistent per-centre neighbour buffer; no-op once shaped.
       CALL nnp_neighbor_ensure_persistent(nnp)
 
-      ! Skin: cap at 10% of the physical cutoff so the image set stays small.
+      ! Cap the skin at 10% of the cutoff so the image set stays small.
       skin = MIN(default_skin, 0.1_dp*nnp%max_cut)
       list_cutoff = nnp%max_cut + skin
 
-      ! Allocate primary-coord buffers when num_atoms changes (or first call)
+      ! (Re)allocate the primary-coord buffers when num_atoms changes.
       IF (.NOT. ALLOCATED(cell_list_cache%coord_primary) .OR. &
           cell_list_cache%num_atoms /= nnp%num_atoms) THEN
          IF (ALLOCATED(cell_list_cache%coord_primary)) DEALLOCATE (cell_list_cache%coord_primary)
@@ -1996,12 +1976,12 @@ CONTAINS
          cell_list_cache%initialized = .FALSE.
       END IF
 
-      ! Refresh primary atom positions every step (PBC-wrapped to the simulation cell)
+      ! Refresh PBC-wrapped primary positions every step.
       DO j = 1, nnp%num_atoms
          cell_list_cache%coord_primary(:, j) = pbc(nnp%coord(:, j), cell)
       END DO
 
-      ! Decide whether a full rebuild is needed
+      ! Rebuild triggers.
       need_rebuild = .NOT. cell_list_cache%initialized
       IF (.NOT. need_rebuild) need_rebuild = (cell_list_cache%num_atoms /= nnp%num_atoms)
       IF (.NOT. need_rebuild) need_rebuild = (ABS(cell_list_cache%exact_cutoff - nnp%max_cut) > cell_tol)
@@ -2010,10 +1990,10 @@ CONTAINS
       IF (.NOT. need_rebuild) need_rebuild = ANY(ABS(cell_list_cache%hmat - cell%hmat) > cell_tol)
 
       IF (.NOT. need_rebuild) THEN
-         ! Verlet skin check: any atom moved more than 0.5*skin from its reference?
-         ! coord_primary is already PBC-wrapped; atoms that cross a box face appear to jump
-         ! by ~box_size, triggering a conservative rebuild — that is correct and harmless.
-         ! No minimum-image correction needed: the rebuild cost is negligible vs a pbc() per atom.
+         ! Verlet check: rebuild if any atom has moved more than 0.5*skin.
+         ! coord_primary is already PBC-wrapped; an atom crossing a box face
+         ! appears to jump by the box edge and forces a conservative rebuild,
+         ! which is correct and avoids a per-atom minimum-image correction.
          half_skin_sq = (0.5_dp*skin)**2
          max_disp_sq = 0.0_dp
          DO j = 1, nnp%num_atoms
@@ -2034,17 +2014,19 @@ CONTAINS
    END SUBROUTINE nnp_prepare_cell_list_cache
 
 ! **************************************************************************************************
-!> \brief Rebuild the cell-list cache from scratch.  Snapshots reference coords, expands all
-!>        (atom, integer PBC shift) image entries, computes the bounding box of all image
-!>        positions (padded by half a skin), lays out a coarse grid with bin_width ≈ list_cutoff,
-!>        and links each image into its bin via head/next.
+!> \brief Rebuild the cell-list cache from scratch.
+!>
+!>        Snapshots the reference coords, expands every (atom, integer PBC
+!>        shift) image, computes the padded bounding box of the image set,
+!>        lays out a coarse grid with bin_width ~ list_cutoff, and links each
+!>        image into its bin via the head/next arrays.
 !> \param nnp ...
 !> \param cell ...
 !> \param exact_cutoff ...
 !> \param list_cutoff ...
 !> \param skin ...
 !> \date   2026-04-24
-!> \author Claudio Malvino
+!> \author Claudio Malagrino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    SUBROUTINE nnp_build_cell_list_cache(nnp, cell, exact_cutoff, list_cutoff, skin)
       TYPE(nnp_type), INTENT(IN), POINTER                :: nnp
@@ -2074,7 +2056,7 @@ CONTAINS
          cl%orthorhombic = cell%orthorhombic
          cl%ref_coord_primary(:, :) = cl%coord_primary(:, :)
 
-         ! Number of integer PBC shifts per dim that span list_cutoff (skin-inflated)
+         ! Number of integer PBC shifts per axis that span list_cutoff.
          CALL nnp_compute_pbc_copies(cl%image_copies, cell, list_cutoff)
 
          n_img = nnp%num_atoms* &
@@ -2090,7 +2072,7 @@ CONTAINS
          ALLOCATE (cl%image_shift(3, n_img))
          ALLOCATE (cl%image_translation(3, n_img))
 
-         ! Build image table and bounding box of all image positions
+         ! Build the image table and the bounding box of all image positions.
          cl%lower(:) = HUGE(1.0_dp)
          cl%upper(:) = -HUGE(1.0_dp)
          img = 0
@@ -2116,11 +2098,11 @@ CONTAINS
             END DO
          END DO
 
-         ! Pad bounding box: half a skin on each side so atoms can drift before rebuild
+         ! Pad the bounding box by half a skin so atoms can drift before rebuild.
          cl%lower(:) = cl%lower(:) - (0.5_dp*skin + rebuild_eps)
          cl%upper(:) = cl%upper(:) + (0.5_dp*skin + rebuild_eps)
 
-         ! Coarse grid: bin_width ≈ list_cutoff, so search range is 1 (27-bin walk)
+         ! Coarse grid: bin_width ~ list_cutoff so bin_span is 1 (3x3x3 walk).
          DO d = 1, 3
             cl%nbin(d) = MAX(1, CEILING((cl%upper(d) - cl%lower(d))/list_cutoff))
             cl%bin_width(d) = (cl%upper(d) - cl%lower(d))/REAL(cl%nbin(d), dp)
@@ -2142,7 +2124,7 @@ CONTAINS
          cl%head(:) = -1
          cl%next(:) = -1
 
-         ! Link each image into its bin's chain (LIFO insertion at the head)
+         ! Link each image into its bin's chain (LIFO at the head).
          DO img = 1, n_img
             j = cl%image_atom(img)
             ipos(:) = cl%coord_primary(:, j) + cl%image_translation(:, img)
@@ -2245,15 +2227,15 @@ CONTAINS
    END SUBROUTINE nnp_compute_pbc_copies
 
 ! **************************************************************************************************
-!> \brief Ensure the module-level persistent neighbour buffer is allocated to the maximum capacity
-!>        needed across all element types.  After the first call (or after num_atoms / cutoff
-!>        changes) every per-centre nnp_compute_neighbors invocation just resets counts and fills
-!>        the existing buffer — no allocation traffic in the hot path.
-!>        Capacity is sized for nnp%max_cut (consistent with the original buffer shape); the
-!>        cell-list query never appends more neighbours than the per-group cutoff allows.
+!> \brief Size the module-level persistent neighbour buffer to the maximum
+!>        capacity needed across element types.
+!>
+!>        After the first call (and after every num_atoms / cutoff change)
+!>        the per-centre nnp_compute_neighbors invocation just resets counts
+!>        and fills the existing buffer.
 !> \param nnp ...
 !> \date   2026-04-28
-!> \author Claudio Malvino
+!> \author Claudio Malagrino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    SUBROUTINE nnp_neighbor_ensure_persistent(nnp)
       TYPE(nnp_type), INTENT(IN), POINTER                :: nnp
@@ -2271,7 +2253,7 @@ CONTAINS
       CALL nnp_env_get(nnp_env=nnp, cell=cell)
 
       CALL nnp_compute_pbc_copies(pbc_copies, cell, nnp%max_cut)
-      ! Correct capacity: product of copies per-dim (2*copies+1) times num_atoms
+      ! Total image count: num_atoms times the per-axis (2*copies+1) product.
       n_capacity = nnp%num_atoms * (2*pbc_copies(1) + 1) * (2*pbc_copies(2) + 1) * (2*pbc_copies(3) + 1)
 
       n_rad_grp = 0
@@ -2281,8 +2263,7 @@ CONTAINS
          IF (nnp%ang(ie)%n_symfgrp > n_ang_grp) n_ang_grp = nnp%ang(ie)%n_symfgrp
       END DO
 
-      ! Ensure module-level scratch temporaries are allocated to handle the largest group
-      ! Determine maximum symf size across all groups
+      ! Size the scratch buffers to the largest symmetry-function group.
       max_sym = 0
       DO ie = 1, nnp%n_ele
          DO s = 1, nnp%rad(ie)%n_symfgrp
@@ -2303,7 +2284,7 @@ CONTAINS
          scratch_max_sym = max_sym
       END IF
 
-      ! Cheap path: buffer already at-or-above required shape, just record current pbc_copies
+      ! Fast path: buffer already at-or-above required shape.
       IF (ALLOCATED(persistent_neighbor%dist_rad) .AND. &
           persistent_n_capacity >= n_capacity .AND. &
           persistent_n_rad_grp >= n_rad_grp .AND. &
@@ -2313,7 +2294,7 @@ CONTAINS
          RETURN
       END IF
 
-      ! (Re)allocate to max capacity across all element types
+      ! Reallocate to the max capacity across element types.
       IF (ALLOCATED(persistent_neighbor%dist_rad)) DEALLOCATE (persistent_neighbor%dist_rad)
       IF (ALLOCATED(persistent_neighbor%dist_ang1)) DEALLOCATE (persistent_neighbor%dist_ang1)
       IF (ALLOCATED(persistent_neighbor%dist_ang2)) DEALLOCATE (persistent_neighbor%dist_ang2)
@@ -2344,14 +2325,15 @@ CONTAINS
    END SUBROUTINE nnp_neighbor_ensure_persistent
 
 ! **************************************************************************************************
-!> \brief Sort active_atoms(1:n) in ascending order, in-place, with zero allocations.
-!>      Used by nnp_calc_acsf to make subsequent walks (especially nnp_scale_acsf's
-!>      dsymdxyz(:, :, k) loop) stride k in increasing order — turns sparse-random atom
-!>      indices into prefetcher-friendly streaming.  Heap sort: O(n log n) worst case, no
-!>      recursion, no auxiliary storage — keeps the algorithm asymptotically clean as
-!>      n_active grows with system size.
+!> \brief In-place heap sort of arr(1:n) in ascending order.
+!>
+!>        Used by nnp_calc_acsf so the downstream walks over the active set
+!>        stride k in increasing order, improving prefetching and TLB
+!>        locality.  O(n log n) worst case, no recursion, no allocations.
 !> \param arr  integer array to sort (only arr(1:n) is touched)
 !> \param n    number of valid entries
+!> \date   2026-04-28
+!> \author Claudio Malagrino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    PURE SUBROUTINE nnp_sort_active_atoms(arr, n)
       INTEGER, DIMENSION(:), INTENT(INOUT)               :: arr
@@ -2362,8 +2344,7 @@ CONTAINS
 
       IF (n < 2) RETURN
 
-      ! Phase 1 — build a max-heap.  Sift down each non-leaf node from the middle of the
-      ! array up to the root; afterwards arr(1) holds the max.
+      ! Phase 1: build a max-heap by sifting each non-leaf node down.
       DO start = n/2, 1, -1
          root = start
          heap_size = n
@@ -2378,8 +2359,7 @@ CONTAINS
          END DO
       END DO
 
-      ! Phase 2 — repeatedly move the root (max) to the end of the live region and sift
-      ! the new root down within the shrunk heap.  After the loop arr(1:n) is ascending.
+      ! Phase 2: swap the root into the live tail and sift the new root down.
       DO last = n, 2, -1
          tmp_val = arr(1); arr(1) = arr(last); arr(last) = tmp_val
          root = 1
