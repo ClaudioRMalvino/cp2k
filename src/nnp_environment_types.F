@@ -114,6 +114,9 @@ MODULE nnp_environment_types
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)         :: atomic_energy
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: committee_energy
       INTEGER, ALLOCATABLE, DIMENSION(:)                  :: ele_ind, nuc_atoms, sort, sort_inv
+      ! Element-sorted index maps above are static for a fixed particle set;
+      ! built once on the first force evaluation (see nnp_calc_energy_force).
+      LOGICAL                                             :: sort_initialized = .FALSE.
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)         :: coord
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)      :: myforce
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :)      :: committee_forces, committee_stress

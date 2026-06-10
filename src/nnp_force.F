@@ -116,21 +116,31 @@ CONTAINS
       IF (calc_forces .AND. need_per_member) nnp%committee_forces(:, :, :) = 0.0_dp
       IF (calc_stress) nnp%committee_stress(:, :, :) = 0.0_dp
 
+      ! The element-sorted index maps (sort/sort_inv/ele_ind/atoms/nuc_atoms)
+      ! depend only on the particle kinds, which are fixed during MD; build
+      ! them once and refresh only the coordinates afterwards.  This removes
+      ! n_ele*N string comparisons and N periodic-table lookups per step.
+      IF (.NOT. nnp%sort_initialized) THEN
+         ig = 1
+         DO i = 1, nnp%n_ele
+            DO j = 1, nnp%num_atoms
+               IF (nnp%ele(i) == particle_set(j)%atomic_kind%element_symbol) THEN
+                  nnp%atoms(ig) = nnp%ele(i)
+                  CALL get_ptable_info(nnp%atoms(ig), number=nnp%nuc_atoms(ig))
+                  nnp%ele_ind(ig) = i
+                  nnp%sort(ig) = j
+                  nnp%sort_inv(j) = ig
+                  ig = ig + 1
+               END IF
+            END DO
+         END DO
+         nnp%sort_initialized = .TRUE.
+      END IF
+
       !fill coord array
-      ig = 1
-      DO i = 1, nnp%n_ele
-         DO j = 1, nnp%num_atoms
-            IF (nnp%ele(i) == particle_set(j)%atomic_kind%element_symbol) THEN
-               DO m = 1, 3
-                  nnp%coord(m, ig) = particle_set(j)%r(m)
-               END DO
-               nnp%atoms(ig) = nnp%ele(i)
-               CALL get_ptable_info(nnp%atoms(ig), number=nnp%nuc_atoms(ig))
-               nnp%ele_ind(ig) = i
-               nnp%sort(ig) = j
-               nnp%sort_inv(j) = ig
-               ig = ig + 1
-            END IF
+      DO ig = 1, nnp%num_atoms
+         DO m = 1, 3
+            nnp%coord(m, ig) = particle_set(nnp%sort(ig))%r(m)
          END DO
       END DO
 
