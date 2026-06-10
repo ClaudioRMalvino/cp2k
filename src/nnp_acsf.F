@@ -29,10 +29,9 @@ MODULE nnp_acsf
                                               nnp_neighbor_type,&
                                               nnp_type
    USE periodic_table,                  ONLY: get_ptable_info
-   USE splines_methods,                 ONLY: hermite_spline_value,&
-                                              init_hermite_spline,&
-                                              init_splinexy
-   USE splines_types,                   ONLY: spline_data_type
+   USE splines_methods,                 ONLY: exp_reduced,&
+                                              minimax_cos,&
+                                              minimax_tanh
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -57,7 +56,7 @@ MODULE nnp_acsf
 !>        triggered by Verlet-skin violation or by changes to num_atoms,
 !>        cell vectors, or cutoff.
 !> \date   2026-04-24
-!> \author Claudio Malagrino (crm98@cam.ac.uk)
+!> \author Claudio Malvino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    TYPE, PRIVATE :: nnp_cell_list_cache_type
       LOGICAL                              :: initialized   = .FALSE.
@@ -90,9 +89,6 @@ MODULE nnp_acsf
       INTEGER, ALLOCATABLE                 :: next(:)
    END TYPE nnp_cell_list_cache_type
 
-   ! Module-level Hermite cubic splines built once at first call to nnp_init_acsf_groups.
-   TYPE(spline_data_type), SAVE, PRIVATE :: spl_exp, spl_cos, spl_tanh
-   LOGICAL, SAVE, PRIVATE                :: spline_initialized = .FALSE.
    TYPE(nnp_cell_list_cache_type), SAVE, PRIVATE :: cell_list_cache
 
    ! Persistent per-centre neighbour buffer reused across atoms in a force
@@ -311,7 +307,7 @@ CONTAINS
          off = nnp%n_rad(ind)
          !$OMP PARALLEL DEFAULT(NONE) &
          !$OMP&   SHARED(neighbor, nnp, ind, i, off, dsymdxyz, has_stress, stress_p, &
-         !$OMP&          cut_type, spl_cos, spl_tanh, &
+         !$OMP&          cut_type, &
          !$OMP&          scratch_max_fc, scratch_fc1, scratch_dfc1, scratch_fc2, scratch_dfc2, &
          !$OMP&          scratch_dr1dx, scratch_dr2dx) &
          !$OMP&   PRIVATE(j, k, jj, kk, rvect1, rvect2, rvect3, r1, r2, r3, r3sq, r1inv, r2inv, &
@@ -365,7 +361,7 @@ CONTAINS
                DO j = 1, neighbor%n_ang1(s)
                   r1 = neighbor%dist_ang1(4, j, s)
                   fc_tmp = r1*sg%pi_over_cut
-                  scratch_fc1(j) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp, y1=dfc_tmp) + 1.0_dp)
+                  scratch_fc1(j) = 0.5_dp*(minimax_cos(fc_tmp, y1=dfc_tmp) + 1.0_dp)
                   scratch_dfc1(j) = 0.5_dp*dfc_tmp*sg%pi_over_cut
                   r1inv = 1.0_dp/r1
                   scratch_dr1dx(1, j) = neighbor%dist_ang1(1, j, s)*r1inv
@@ -378,7 +374,7 @@ CONTAINS
                   DO k = 1, neighbor%n_ang2(s)
                      r2 = neighbor%dist_ang2(4, k, s)
                      fc_tmp = r2*sg%pi_over_cut
-                     scratch_fc2(k) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp, y1=dfc_tmp) + 1.0_dp)
+                     scratch_fc2(k) = 0.5_dp*(minimax_cos(fc_tmp, y1=dfc_tmp) + 1.0_dp)
                      scratch_dfc2(k) = 0.5_dp*dfc_tmp*sg%pi_over_cut
                      r2inv = 1.0_dp/r2
                      scratch_dr2dx(1, k) = neighbor%dist_ang2(1, k, s)*r2inv
@@ -392,7 +388,7 @@ CONTAINS
                DO j = 1, neighbor%n_ang1(s)
                   r1 = neighbor%dist_ang1(4, j, s)
                   fc_tmp = 1.0_dp - r1*sg%inv_cut
-                  tanh_v = hermite_spline_value(spl_tanh, fc_tmp)
+                  tanh_v = minimax_tanh(fc_tmp)
                   scratch_fc1(j) = tanh_v**3
                   scratch_dfc1(j) = (-3.0_dp*sg%inv_cut)*(tanh_v**2 - tanh_v**4)
                   r1inv = 1.0_dp/r1
@@ -406,7 +402,7 @@ CONTAINS
                   DO k = 1, neighbor%n_ang2(s)
                      r2 = neighbor%dist_ang2(4, k, s)
                      fc_tmp = 1.0_dp - r2*sg%inv_cut
-                     tanh_v = hermite_spline_value(spl_tanh, fc_tmp)
+                     tanh_v = minimax_tanh(fc_tmp)
                      scratch_fc2(k) = tanh_v**3
                      scratch_dfc2(k) = (-3.0_dp*sg%inv_cut)*(tanh_v**2 - tanh_v**4)
                      r2inv = 1.0_dp/r2
@@ -587,7 +583,7 @@ CONTAINS
          CALL timeset('nnp_acsf_angular', handle_sf)
          off = nnp%n_rad(ind)
          !$OMP PARALLEL DEFAULT(NONE) &
-         !$OMP&   SHARED(neighbor, nnp, ind, off, cut_type, spl_cos, spl_tanh, &
+         !$OMP&   SHARED(neighbor, nnp, ind, off, cut_type, &
          !$OMP&          scratch_max_fc, scratch_fc1, scratch_dfc1, scratch_fc2, scratch_dfc2, &
          !$OMP&          scratch_dr1dx, scratch_dr2dx) &
          !$OMP&   PRIVATE(j, k, rvect1, rvect2, rvect3, r1, r2, r3, r3sq, &
@@ -634,14 +630,14 @@ CONTAINS
                !$OMP DO SCHEDULE(static)
                DO j = 1, neighbor%n_ang1(s)
                   fc_tmp = neighbor%dist_ang1(4, j, s)*sg%pi_over_cut
-                  scratch_fc1(j) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp) + 1.0_dp)
+                  scratch_fc1(j) = 0.5_dp*(minimax_cos(fc_tmp) + 1.0_dp)
                END DO
                !$OMP END DO
                IF (sg%ele(1) /= sg%ele(2)) THEN
                   !$OMP DO SCHEDULE(static)
                   DO k = 1, neighbor%n_ang2(s)
                      fc_tmp = neighbor%dist_ang2(4, k, s)*sg%pi_over_cut
-                     scratch_fc2(k) = 0.5_dp*(hermite_spline_value(spl_cos, fc_tmp) + 1.0_dp)
+                     scratch_fc2(k) = 0.5_dp*(minimax_cos(fc_tmp) + 1.0_dp)
                   END DO
                   !$OMP END DO
                END IF
@@ -649,14 +645,14 @@ CONTAINS
                !$OMP DO SCHEDULE(static)
                DO j = 1, neighbor%n_ang1(s)
                   fc_tmp = 1.0_dp - neighbor%dist_ang1(4, j, s)*sg%inv_cut
-                  scratch_fc1(j) = hermite_spline_value(spl_tanh, fc_tmp)**3
+                  scratch_fc1(j) = minimax_tanh(fc_tmp)**3
                END DO
                !$OMP END DO
                IF (sg%ele(1) /= sg%ele(2)) THEN
                   !$OMP DO SCHEDULE(static)
                   DO k = 1, neighbor%n_ang2(s)
                      fc_tmp = 1.0_dp - neighbor%dist_ang2(4, k, s)*sg%inv_cut
-                     scratch_fc2(k) = hermite_spline_value(spl_tanh, fc_tmp)**3
+                     scratch_fc2(k) = minimax_tanh(fc_tmp)**3
                   END DO
                   !$OMP END DO
                END IF
@@ -1011,15 +1007,15 @@ CONTAINS
       CASE (nnp_cut_cos)
          tmp = r * sg%pi_over_cut
          IF (PRESENT(force)) THEN
-            fcut = 0.5_dp*(hermite_spline_value(spl_cos, tmp, y1=dcos_dx) + 1.0_dp)
+            fcut = 0.5_dp*(minimax_cos(tmp, y1=dcos_dx) + 1.0_dp)
             dfcutdr = 0.5_dp*dcos_dx*(pi/funccut)
          ELSE
-            fcut = 0.5_dp*(hermite_spline_value(spl_cos, tmp) + 1.0_dp)
+            fcut = 0.5_dp*(minimax_cos(tmp) + 1.0_dp)
          END IF
 
       CASE (nnp_cut_tanh)
          tmp = 1.0_dp - r * sg%inv_cut
-         tanh_val = hermite_spline_value(spl_tanh, tmp)
+         tanh_val = minimax_tanh(tmp)
          fcut = tanh_val**3
          IF (PRESENT(force)) &
             dfcutdr = (-3.0_dp/funccut)*(tanh_val**2 - tanh_val**4)
@@ -1046,14 +1042,14 @@ CONTAINS
 
          ! Reuse the spline value in the chain rule (d/dx exp(x) = exp(x));
          ! more accurate than evaluating the spline derivative separately.
-         IF (tmp <= spl_exp%x1) THEN
+         IF (tmp <= -50.0_dp) THEN
             sym(sf) = 0.0_dp
             IF (PRESENT(force)) dsymdr = 0.0_dp
          ELSE IF (tmp >= 0.0_dp) THEN
             sym(sf) = 1.0_dp
             IF (PRESENT(force)) dsymdr = 0.0_dp
          ELSE
-            sym(sf) = hermite_spline_value(spl_exp, tmp)
+            sym(sf) = exp_reduced(tmp)
             IF (PRESENT(force)) dsymdr = sym(sf)*(-2.0_dp*eta*(r - rs))
          END IF
 
@@ -1137,24 +1133,24 @@ CONTAINS
       CASE (nnp_cut_cos)
          tmp3 = r3 * sg%pi_over_cut
          IF (PRESENT(force)) THEN
-            fcut3 = 0.5_dp*(hermite_spline_value(spl_cos, tmp3, y1=dcos_dx3) + 1.0_dp)
+            fcut3 = 0.5_dp*(minimax_cos(tmp3, y1=dcos_dx3) + 1.0_dp)
             IF (PRESENT(fc1_in)) THEN
                fcut1 = fc1_in;  fcut2 = fc2_in
             ELSE
                tmp1 = r1 * sg%pi_over_cut
                tmp2 = r2 * sg%pi_over_cut
-               fcut1 = 0.5_dp*(hermite_spline_value(spl_cos, tmp1, y1=dcos_dx1) + 1.0_dp)
-               fcut2 = 0.5_dp*(hermite_spline_value(spl_cos, tmp2, y1=dcos_dx2) + 1.0_dp)
+               fcut1 = 0.5_dp*(minimax_cos(tmp1, y1=dcos_dx1) + 1.0_dp)
+               fcut2 = 0.5_dp*(minimax_cos(tmp2, y1=dcos_dx2) + 1.0_dp)
             END IF
          ELSE
-            fcut3 = 0.5_dp*(hermite_spline_value(spl_cos, tmp3) + 1.0_dp)
+            fcut3 = 0.5_dp*(minimax_cos(tmp3) + 1.0_dp)
             IF (PRESENT(fc1_in)) THEN
                fcut1 = fc1_in;  fcut2 = fc2_in
             ELSE
                tmp1 = r1 * sg%pi_over_cut
                tmp2 = r2 * sg%pi_over_cut
-               fcut1 = 0.5_dp*(hermite_spline_value(spl_cos, tmp1) + 1.0_dp)
-               fcut2 = 0.5_dp*(hermite_spline_value(spl_cos, tmp2) + 1.0_dp)
+               fcut1 = 0.5_dp*(minimax_cos(tmp1) + 1.0_dp)
+               fcut2 = 0.5_dp*(minimax_cos(tmp2) + 1.0_dp)
             END IF
          END IF
          ftot = fcut1*fcut2*fcut3
@@ -1172,15 +1168,15 @@ CONTAINS
 
       CASE (nnp_cut_tanh)
          tmp3 = 1.0_dp - r3 * sg%inv_cut
-         tanh_val3 = hermite_spline_value(spl_tanh, tmp3)
+         tanh_val3 = minimax_tanh(tmp3)
          fcut3 = tanh_val3**3
          IF (PRESENT(fc1_in)) THEN
             fcut1 = fc1_in;  fcut2 = fc2_in
          ELSE
             tmp1 = 1.0_dp - r1 * sg%inv_cut
             tmp2 = 1.0_dp - r2 * sg%inv_cut
-            tanh_val1 = hermite_spline_value(spl_tanh, tmp1)
-            tanh_val2 = hermite_spline_value(spl_tanh, tmp2)
+            tanh_val1 = minimax_tanh(tmp1)
+            tanh_val2 = minimax_tanh(tmp2)
             fcut1 = tanh_val1**3
             fcut2 = tanh_val2**3
          END IF
@@ -1276,12 +1272,12 @@ CONTAINS
          ! Spline evaluation of EXP.  The chain rule below reuses symtmp
          ! (d/dx exp(x) = exp(x)), so no second spline call is needed.
          tmp = -eta*r_sum_sq
-         IF (tmp <= spl_exp%x1) THEN
+         IF (tmp <= -50.0_dp) THEN
             symtmp = 0.0_dp
          ELSE IF (tmp >= 0.0_dp) THEN
             symtmp = 1.0_dp
          ELSE
-            symtmp = hermite_spline_value(spl_exp, tmp)
+            symtmp = exp_reduced(tmp)
          END IF
 
          IF (PRESENT(force)) THEN
@@ -1339,7 +1335,7 @@ CONTAINS
 !> \param arr  integer array to sort (only arr(1:n) is touched)
 !> \param n    number of valid entries
 !> \date   2026-04-28
-!> \author Claudio Malagrino (crm98@cam.ac.uk)
+!> \author Claudio Malvino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    PURE SUBROUTINE nnp_sort_active_atoms(arr, n)
       INTEGER, DIMENSION(:), INTENT(INOUT)               :: arr
@@ -1696,8 +1692,7 @@ CONTAINS
 
       INTEGER                                            :: ang, i, j, k, rad, s, zint
       INTEGER                                            :: col, pos
-      REAL(KIND=dp)                                      :: funccut, h_spl, x_j
-      REAL(KIND=dp), ALLOCATABLE                         :: dydx(:)
+      REAL(KIND=dp)                                      :: funccut
 
       ! Precompute integer-zeta companions (NINT and is-integer flag) once.  Sort has already
       ! finalised the order of zeta(:) by the time this routine runs, so a single pass suffices.
@@ -1889,50 +1884,9 @@ CONTAINS
             END IF
       END DO
 
-      ! -------------------------------------------------------------------------
-      ! Hermite Spline Initialisation via splines_methods infrastructure
-      ! -------------------------------------------------------------------------
-      IF (.NOT. spline_initialized) THEN
-         ALLOCATE(dydx(5000))
-
-         ! EXP spline on [-50, 0]: d/dx[exp(x)] = exp(x)
-         CALL init_splinexy(spl_exp, 5000)
-         spl_exp%x1 = -50.0_dp
-         h_spl = 50.0_dp/REAL(4999, KIND=dp)
-         DO i = 1, 5000
-            x_j = -50.0_dp + REAL(i - 1, KIND=dp)*h_spl
-            spl_exp%y(i) = EXP(x_j)
-            dydx(i) = spl_exp%y(i)
-         END DO
-         CALL init_hermite_spline(spl_exp, h_spl, dydx)
-
-         ! COS spline on [0, pi]: d/dx[cos(x)] = -sin(x)
-         ! Argument is pi*r/cutoff in [0, pi) so this domain covers all physical inputs.
-         CALL init_splinexy(spl_cos, 5000)
-         spl_cos%x1 = 0.0_dp
-         h_spl = pi/REAL(4999, KIND=dp)
-         DO i = 1, 5000
-            x_j = REAL(i - 1, KIND=dp)*h_spl
-            spl_cos%y(i) = COS(x_j)
-            dydx(i) = -SIN(x_j)
-         END DO
-         CALL init_hermite_spline(spl_cos, h_spl, dydx)
-
-         ! TANH spline on [0, 1]: d/dx[tanh(x)] = 1 - tanh^2(x)
-         ! Argument is 1 - r/cutoff in (0, 1] so this domain covers all physical inputs.
-         CALL init_splinexy(spl_tanh, 5000)
-         spl_tanh%x1 = 0.0_dp
-         h_spl = 1.0_dp/REAL(4999, KIND=dp)
-         DO i = 1, 5000
-            x_j = REAL(i - 1, KIND=dp)*h_spl
-            spl_tanh%y(i) = TANH(x_j)
-            dydx(i) = 1.0_dp - spl_tanh%y(i)**2
-         END DO
-         CALL init_hermite_spline(spl_tanh, h_spl, dydx)
-
-         DEALLOCATE(dydx)
-         spline_initialized = .TRUE.
-      END IF
+      ! The EXP/COS/TANH cutoff and Gaussian evaluations now use table-free minimax polynomials
+      ! (minimax_cos / minimax_tanh / exp_reduced in splines_methods); no per-run spline tables are
+      ! built here any more.
 
    END SUBROUTINE nnp_init_acsf_groups
 
@@ -2101,7 +2055,7 @@ CONTAINS
 !>        exceeds 0.5*skin or when num_atoms / cell vectors / cutoff change.
 !> \param nnp ...
 !> \date   2026-04-24
-!> \author Claudio Malagrino (crm98@cam.ac.uk)
+!> \author Claudio Malvino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    SUBROUTINE nnp_prepare_cell_list_cache(nnp)
       TYPE(nnp_type), INTENT(INOUT), POINTER             :: nnp
@@ -2189,7 +2143,7 @@ CONTAINS
 !> \param list_cutoff ...
 !> \param skin ...
 !> \date   2026-04-24
-!> \author Claudio Malagrino (crm98@cam.ac.uk)
+!> \author Claudio Malvino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    SUBROUTINE nnp_build_cell_list_cache(nnp, cell, exact_cutoff, list_cutoff, skin)
       TYPE(nnp_type), INTENT(IN), POINTER                :: nnp
@@ -2398,7 +2352,7 @@ CONTAINS
 !>        and fills the existing buffer.
 !> \param nnp ...
 !> \date   2026-04-28
-!> \author Claudio Malagrino (crm98@cam.ac.uk)
+!> \author Claudio Malvino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    SUBROUTINE nnp_neighbor_ensure_persistent(nnp)
       TYPE(nnp_type), INTENT(IN), POINTER                :: nnp
