@@ -87,6 +87,10 @@ MODULE nnp_acsf
       ! Linked-list cell grid.
       INTEGER, ALLOCATABLE                 :: head(:)
       INTEGER, ALLOCATABLE                 :: next(:)
+      ! Longest bin chain at the last rebuild; bounds the per-centre
+      ! candidate count (walk bins x occupancy) used to size the
+      ! persistent neighbour buffer.
+      INTEGER                              :: max_bin_occupancy = 0
    END TYPE nnp_cell_list_cache_type
 
    TYPE(nnp_cell_list_cache_type), SAVE, PRIVATE :: cell_list_cache
@@ -2003,6 +2007,8 @@ CONTAINS
                      IF (r2 < nnp%rad(ind)%symfgrp(s)%cutoff_sq) THEN
                         IF (norm < 0.0_dp) norm = SQRT(r2)
                         n_count = neighbor%n_rad(s) + 1
+                        IF (n_count > persistent_n_capacity) &
+                           CPABORT("NNP| persistent neighbour buffer overflow (rad)")
                         neighbor%n_rad(s) = n_count
                         neighbor%ind_rad(n_count, s) = j
                         neighbor%dist_rad(1, n_count, s) = drx
@@ -2017,6 +2023,8 @@ CONTAINS
                      IF (j_type == nnp%ang(ind)%symfgrp(s)%ele_ind(1)) THEN
                         IF (norm < 0.0_dp) norm = SQRT(r2)
                         n_count = neighbor%n_ang1(s) + 1
+                        IF (n_count > persistent_n_capacity) &
+                           CPABORT("NNP| persistent neighbour buffer overflow (ang1)")
                         neighbor%n_ang1(s) = n_count
                         neighbor%ind_ang1(n_count, s) = j
                         neighbor%dist_ang1(1, n_count, s) = drx
@@ -2027,6 +2035,8 @@ CONTAINS
                      IF (j_type == nnp%ang(ind)%symfgrp(s)%ele_ind(2)) THEN
                         IF (norm < 0.0_dp) norm = SQRT(r2)
                         n_count = neighbor%n_ang2(s) + 1
+                        IF (n_count > persistent_n_capacity) &
+                           CPABORT("NNP| persistent neighbour buffer overflow (ang2)")
                         neighbor%n_ang2(s) = n_count
                         neighbor%ind_ang2(n_count, s) = j
                         neighbor%dist_ang2(1, n_count, s) = drx
@@ -2064,7 +2074,7 @@ CONTAINS
       REAL(KIND=dp), PARAMETER                           :: default_skin = 1.0_dp, &
                                                             cell_tol = 1.0e-12_dp
 
-      INTEGER                                            :: handle, j
+      INTEGER                                            :: handle, j, n_capacity, n_walk_bins
       LOGICAL                                            :: need_rebuild
       REAL(KIND=dp)                                      :: dispsq, half_skin_sq, list_cutoff, &
                                                             max_disp_sq, skin
@@ -2075,9 +2085,6 @@ CONTAINS
 
       NULLIFY (cell)
       CALL nnp_env_get(nnp_env=nnp, cell=cell)
-
-      ! Size the persistent per-centre neighbour buffer; no-op once shaped.
-      CALL nnp_neighbor_ensure_persistent(nnp)
 
       ! Cap the skin at 10% of the cutoff so the image set stays small.
       skin = MIN(default_skin, 0.1_dp*nnp%max_cut)
@@ -2125,6 +2132,17 @@ CONTAINS
       END IF
 
       IF (need_rebuild) CALL nnp_build_cell_list_cache(nnp, cell, nnp%max_cut, list_cutoff, skin)
+
+      ! Size the persistent per-centre neighbour buffer to what one cell-list
+      ! walk can actually visit (walk bins x longest chain), not to
+      ! num_atoms*(2p+1)^3 images.  Chains are static between rebuilds, so
+      ! the bound holds for every step the current list serves.
+      n_walk_bins = MIN(cell_list_cache%nbin(1), 2*cell_list_cache%bin_span(1) + 1)* &
+                    MIN(cell_list_cache%nbin(2), 2*cell_list_cache%bin_span(2) + 1)* &
+                    MIN(cell_list_cache%nbin(3), 2*cell_list_cache%bin_span(3) + 1)
+      n_capacity = MAX(1, MIN(cell_list_cache%n_images, &
+                              n_walk_bins*cell_list_cache%max_bin_occupancy))
+      CALL nnp_neighbor_ensure_persistent(nnp, n_capacity)
 
       CALL timestop(handle)
 
@@ -2251,6 +2269,19 @@ CONTAINS
             cl%head(cell_idx) = img
          END DO
 
+         ! Longest chain; chains are static until the next rebuild, so this
+         ! exactly bounds what any 3x3x3 (or wider) walk can visit per bin.
+         cl%max_bin_occupancy = 0
+         DO cell_idx = 1, n_cells_total
+            d = 0
+            img = cl%head(cell_idx)
+            DO WHILE (img > 0)
+               d = d + 1
+               img = cl%next(img)
+            END DO
+            IF (d > cl%max_bin_occupancy) cl%max_bin_occupancy = d
+         END DO
+
          cl%initialized = .TRUE.
 
       END ASSOCIATE
@@ -2351,15 +2382,18 @@ CONTAINS
 !>        the per-centre nnp_compute_neighbors invocation just resets counts
 !>        and fills the existing buffer.
 !> \param nnp ...
+!> \param n_capacity  per-group row capacity; the caller derives it from the
+!>                    cell-list walk bound (bins visited x longest chain)
 !> \date   2026-04-28
 !> \author Claudio Malvino (crm98@cam.ac.uk)
 ! **************************************************************************************************
-   SUBROUTINE nnp_neighbor_ensure_persistent(nnp)
+   SUBROUTINE nnp_neighbor_ensure_persistent(nnp, n_capacity)
       TYPE(nnp_type), INTENT(IN), POINTER                :: nnp
+      INTEGER, INTENT(IN)                                :: n_capacity
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'nnp_neighbor_ensure_persistent'
 
-      INTEGER                                            :: handle, ie, n_ang_grp, n_capacity, &
+      INTEGER                                            :: handle, ie, n_ang_grp, &
                                  n_rad_grp, max_sym, s
       INTEGER, DIMENSION(3)                              :: pbc_copies
       TYPE(cell_type), POINTER                           :: cell
@@ -2370,8 +2404,6 @@ CONTAINS
       CALL nnp_env_get(nnp_env=nnp, cell=cell)
 
       CALL nnp_compute_pbc_copies(pbc_copies, cell, nnp%max_cut)
-      ! Total image count: num_atoms times the per-axis (2*copies+1) product.
-      n_capacity = nnp%num_atoms * (2*pbc_copies(1) + 1) * (2*pbc_copies(2) + 1) * (2*pbc_copies(3) + 1)
 
       n_rad_grp = 0
       n_ang_grp = 0
