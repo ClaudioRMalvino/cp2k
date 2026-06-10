@@ -2397,16 +2397,18 @@ CONTAINS
       projb = ABS(SUM(cell%hmat(:, 2)*axc(:)))*0.5_dp
       projc = ABS(SUM(cell%hmat(:, 3)*axb(:)))*0.5_dp
 
-      pbc_copies(:) = 0
-      DO WHILE ((pbc_copies(1) + 1)*proja <= cutoff)
-         pbc_copies(1) = pbc_copies(1) + 1
-      END DO
-      DO WHILE ((pbc_copies(2) + 1)*projb <= cutoff)
-         pbc_copies(2) = pbc_copies(2) + 1
-      END DO
-      DO WHILE ((pbc_copies(3) + 1)*projc <= cutoff)
-         pbc_copies(3) = pbc_copies(3) + 1
-      END DO
+      ! Shift count for EXPLICIT image enumeration: a pair straddling a cell
+      ! face pairs a primary atom with the +-1 image of its partner even when
+      ! the cutoff is far below the half-box, so every periodic axis needs
+      ! |T| <= 1 + cutoff/height (height = 2*proj).  The upstream per-pair
+      ! pbc() search folds displacements to the minimum image and needs
+      ! copies only when the cutoff exceeds the half-box; reusing that count
+      ! here silently dropped every cross-face pair along any axis longer
+      ! than 2*cutoff, producing step-discontinuities in the PES whenever an
+      ! atom wrapped across such a face (the N>=128 instability).
+      pbc_copies(1) = FLOOR(1.0_dp + cutoff/(2.0_dp*proja))
+      pbc_copies(2) = FLOOR(1.0_dp + cutoff/(2.0_dp*projb))
+      pbc_copies(3) = FLOOR(1.0_dp + cutoff/(2.0_dp*projc))
       ! Apply non periodic setting
       pbc_copies(:) = pbc_copies(:)*cell%perd(:)
 
