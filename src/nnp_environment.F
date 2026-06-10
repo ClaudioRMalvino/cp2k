@@ -551,7 +551,6 @@ CONTAINS
          DO j = 1, nnp_env%n_layer
             ALLOCATE (nnp_env%arc(i)%layer(j)%node(nnp_env%arc(i)%n_nodes(j)))
             ALLOCATE (nnp_env%arc(i)%layer(j)%node_grad(nnp_env%arc(i)%n_nodes(j)))
-            ALLOCATE (nnp_env%arc(i)%layer(j)%tmp_der(nnp_env%arc(i)%n_nodes(1), nnp_env%arc(i)%n_nodes(j)))
          END DO
       END DO
 

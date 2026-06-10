@@ -173,8 +173,9 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'nnp_gradients'
 
-      INTEGER                                            :: handle, i, j, k
+      INTEGER                                            :: handle, i, k
       REAL(KIND=dp)                                      :: norm
+      REAL(KIND=dp), DIMENSION(MAXVAL(arc%n_nodes))      :: delta, work
 
       CALL timeset(routineN, handle)
 
@@ -216,47 +217,37 @@ CONTAINS
 
       END DO
 
-      ! calculate \frac{\partial f^1(x_j^1)}{\partial G_i}*a_{ij}^{01}
-      DO j = 1, arc%n_nodes(2)
-         DO i = 1, arc%n_nodes(1)
-            arc%layer(2)%tmp_der(i, j) = arc%layer(2)%node_grad(j)*arc%layer(2)%weights(i, j, i_com)
+      ! Reverse-mode (adjoint) accumulation.  The network output is the
+      ! scalar E = y_L(1), so dE/dG follows from a single backward sweep of
+      ! vector-matrix products:
+      !    delta_L = 1
+      !    delta_{k-1}(m) = sum_j W_k(m, j) * f'_k(j) * delta_k(j)
+      !    dE/dG_i = delta_1(i)
+      ! node_grad holds f'_k (including the optional 1/n normalisation).
+      ! Cost is O(sum_k n_{k-1}*n_k), independent of the descriptor
+      ! dimension; the forward-mode Jacobian sweep this replaces cost
+      ! O(n_1 * sum_k n_{k-1}*n_k) and kept only its first column.
+      delta(1) = 1.0_dp
+      DO k = nnp%n_layer, 2, -1
+         DO i = 1, arc%n_nodes(k)
+            work(i) = arc%layer(k)%node_grad(i)*delta(i)
          END DO
-      END DO
-
-      DO k = 3, nnp%n_layer
-         ! Reset tmp_der:
-         arc%layer(k)%tmp_der(:, :) = 0.0_dp
-         !Perform matrix-matrix product
-         !C := alpha*A*B + beta*C
-         !with A = layer(k-1)%tmp_der
-         !and  B = layer(k)%weights
-         !and  C = tmp
-         CALL DGEMM('N', & !don't transpose matrix A
-                    'N', & !don't transpose matrix B
-                    arc%n_nodes(1), & !number of rows of A
-                    arc%n_nodes(k), & !number of columns of B
-                    arc%n_nodes(k - 1), & !number of col of A and nb of rows of B
+         !delta_{k-1} := W_k * work
+         CALL DGEMV('N', & !don't transpose matrix A
+                    arc%n_nodes(k - 1), & !number of rows of A
+                    arc%n_nodes(k), & !number of columns of A
                     1.0_dp, & !alpha
-                    arc%layer(k - 1)%tmp_der, & !matrix A
-                    arc%n_nodes(1), & !leading dimension of A
-                    arc%layer(k)%weights(:, :, i_com), & !matrix B
-                    arc%n_nodes(k - 1), & !leading dimension of B
-                    1.0_dp, & !beta
-                    arc%layer(k)%tmp_der, & !matrix C
-                    arc%n_nodes(1)) !leading dimension of C
-
-         ! sum over all nodes in the target layer
-         DO j = 1, arc%n_nodes(k)
-            ! sum over input layer
-            DO i = 1, arc%n_nodes(1)
-               arc%layer(k)%tmp_der(i, j) = arc%layer(k)%node_grad(j)* &
-                                            arc%layer(k)%tmp_der(i, j)
-            END DO
-         END DO
+                    arc%layer(k)%weights(:, :, i_com), & !matrix A
+                    arc%n_nodes(k - 1), & !leading dimension of A
+                    work, & !vector x
+                    1, & !increment for the elements of x
+                    0.0_dp, & !beta
+                    delta, & !vector y
+                    1) !increment for the elements of y
       END DO
 
       DO i = 1, arc%n_nodes(1)
-         denergydsym(i) = arc%layer(nnp%n_layer)%tmp_der(i, 1)
+         denergydsym(i) = delta(i)
       END DO
 
       CALL timestop(handle)

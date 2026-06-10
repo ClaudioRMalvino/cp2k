@@ -224,7 +224,7 @@ CONTAINS
             ! predict forces; the inner loop is restricted to the active set
             ! built by nnp_calc_acsf, so the cost is O(n_active) per centre.
             IF (calc_forces) THEN
-               denergydsym(1:nnp%arc(ind)%n_nodes(1)) = 0.0_dp
+               ! nnp_gradients fully assigns denergydsym(1:n_nodes(1))
                CALL nnp_gradients(nnp%arc(ind), nnp, i_com, denergydsym)
                IF (calc_stress) THEN
                   DO j = 1, nnp%arc(ind)%n_nodes(1)

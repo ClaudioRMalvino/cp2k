@@ -286,7 +286,6 @@ MODULE nnp_environment_types
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)         :: bweights ! bias weights
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: node ! DIM(n_nodes)
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)            :: node_grad ! DIM(n_nodes)
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)         :: tmp_der ! DIM(n_sym,n_nodes)
    END TYPE nnp_arc_layer_type
 
 CONTAINS
@@ -382,9 +381,6 @@ CONTAINS
                   END IF
                   IF (ALLOCATED(nnp_env%arc(i)%layer(j)%bweights)) THEN
                      DEALLOCATE (nnp_env%arc(i)%layer(j)%bweights)
-                  END IF
-                  IF (ALLOCATED(nnp_env%arc(i)%layer(j)%tmp_der)) THEN
-                     DEALLOCATE (nnp_env%arc(i)%layer(j)%tmp_der)
                   END IF
                END DO
                DEALLOCATE (nnp_env%arc(i)%layer, &
