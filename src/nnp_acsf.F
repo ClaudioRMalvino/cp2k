@@ -2172,9 +2172,9 @@ CONTAINS
       REAL(KIND=dp), PARAMETER                           :: rebuild_eps = 1.0e-10_dp
 
       INTEGER                                            :: cell_idx, d, handle, img, j, &
-                                                            n_cells_total, n_img, tx, ty, tz
+                                                            n_cells_total, n_img, n_kept, tx, ty, tz
       INTEGER, DIMENSION(3)                              :: bin
-      REAL(KIND=dp), DIMENSION(3)                        :: ipos
+      REAL(KIND=dp), DIMENSION(3)                        :: ipos, pmax, pmin, trans, whigh, wlow
 
       CALL timeset(routineN, handle)
 
@@ -2194,10 +2194,44 @@ CONTAINS
          ! Number of integer PBC shifts per axis that span list_cutoff.
          CALL nnp_compute_pbc_copies(cl%image_copies, cell, list_cutoff)
 
-         n_img = nnp%num_atoms* &
-                 (2*cl%image_copies(1) + 1)* &
-                 (2*cl%image_copies(2) + 1)* &
-                 (2*cl%image_copies(3) + 1)
+         ! Halo filter: centre atoms live in the primary cell, so an image
+         ! can only ever be paired if its build position lies within
+         ! list_cutoff of the primary bounding box (per-axis test is a
+         ! conservative lower bound on the distance).  Verlet drift is
+         ! covered because list_cutoff = max_cut + skin while both partners
+         ! move at most skin/2 before a rebuild.  This keeps ~(1+2d/L)^3*N
+         ! of the (2p+1)^3*N candidate images.
+         pmin(:) = HUGE(1.0_dp)
+         pmax(:) = -HUGE(1.0_dp)
+         DO j = 1, nnp%num_atoms
+            DO d = 1, 3
+               IF (cl%coord_primary(d, j) < pmin(d)) pmin(d) = cl%coord_primary(d, j)
+               IF (cl%coord_primary(d, j) > pmax(d)) pmax(d) = cl%coord_primary(d, j)
+            END DO
+         END DO
+         wlow(:) = pmin(:) - (list_cutoff + rebuild_eps)
+         whigh(:) = pmax(:) + (list_cutoff + rebuild_eps)
+
+         ! Pass 1: count the images inside the halo window.
+         n_kept = 0
+         DO tz = -cl%image_copies(3), cl%image_copies(3)
+         DO ty = -cl%image_copies(2), cl%image_copies(2)
+         DO tx = -cl%image_copies(1), cl%image_copies(1)
+            trans(:) = cell%hmat(:, 1)*REAL(tx, dp) + &
+                       cell%hmat(:, 2)*REAL(ty, dp) + &
+                       cell%hmat(:, 3)*REAL(tz, dp)
+            DO j = 1, nnp%num_atoms
+               ipos(:) = cl%coord_primary(:, j) + trans(:)
+               IF (ipos(1) < wlow(1) .OR. ipos(1) > whigh(1)) CYCLE
+               IF (ipos(2) < wlow(2) .OR. ipos(2) > whigh(2)) CYCLE
+               IF (ipos(3) < wlow(3) .OR. ipos(3) > whigh(3)) CYCLE
+               n_kept = n_kept + 1
+            END DO
+         END DO
+         END DO
+         END DO
+
+         n_img = n_kept
          cl%n_images = n_img
 
          IF (ALLOCATED(cl%image_atom)) DEALLOCATE (cl%image_atom)
@@ -2207,30 +2241,34 @@ CONTAINS
          ALLOCATE (cl%image_shift(3, n_img))
          ALLOCATE (cl%image_translation(3, n_img))
 
-         ! Build the image table and the bounding box of all image positions.
+         ! Pass 2: fill the image table and the bounding box of kept images.
          cl%lower(:) = HUGE(1.0_dp)
          cl%upper(:) = -HUGE(1.0_dp)
          img = 0
-         DO j = 1, nnp%num_atoms
-            DO tz = -cl%image_copies(3), cl%image_copies(3)
-            DO ty = -cl%image_copies(2), cl%image_copies(2)
-            DO tx = -cl%image_copies(1), cl%image_copies(1)
+         DO tz = -cl%image_copies(3), cl%image_copies(3)
+         DO ty = -cl%image_copies(2), cl%image_copies(2)
+         DO tx = -cl%image_copies(1), cl%image_copies(1)
+            trans(:) = cell%hmat(:, 1)*REAL(tx, dp) + &
+                       cell%hmat(:, 2)*REAL(ty, dp) + &
+                       cell%hmat(:, 3)*REAL(tz, dp)
+            DO j = 1, nnp%num_atoms
+               ipos(:) = cl%coord_primary(:, j) + trans(:)
+               IF (ipos(1) < wlow(1) .OR. ipos(1) > whigh(1)) CYCLE
+               IF (ipos(2) < wlow(2) .OR. ipos(2) > whigh(2)) CYCLE
+               IF (ipos(3) < wlow(3) .OR. ipos(3) > whigh(3)) CYCLE
                img = img + 1
                cl%image_atom(img) = j
                cl%image_shift(1, img) = tx
                cl%image_shift(2, img) = ty
                cl%image_shift(3, img) = tz
-               cl%image_translation(:, img) = cell%hmat(:, 1)*REAL(tx, dp) + &
-                                              cell%hmat(:, 2)*REAL(ty, dp) + &
-                                              cell%hmat(:, 3)*REAL(tz, dp)
-               ipos(:) = cl%coord_primary(:, j) + cl%image_translation(:, img)
+               cl%image_translation(:, img) = trans(:)
                DO d = 1, 3
                   IF (ipos(d) < cl%lower(d)) cl%lower(d) = ipos(d)
                   IF (ipos(d) > cl%upper(d)) cl%upper(d) = ipos(d)
                END DO
             END DO
-            END DO
-            END DO
+         END DO
+         END DO
          END DO
 
          ! Pad the bounding box by half a skin so atoms can drift before rebuild.
