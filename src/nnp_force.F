@@ -69,7 +69,7 @@ CONTAINS
                                                             istart, j, k, m, max_nsym, mecalc, &
                                                             n_active, n_base, n_remainder
       INTEGER, ALLOCATABLE, DIMENSION(:), SAVE                 :: active_atoms, active_flag
-      LOGICAL                                            :: calc_stress
+      LOGICAL                                            :: calc_stress, need_per_member
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:), SAVE           :: denergydsym
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), SAVE    :: dsymdxyz, stress
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
@@ -77,7 +77,7 @@ CONTAINS
       TYPE(cp_subsys_type), POINTER                      :: subsys
       TYPE(distribution_1d_type), POINTER                :: local_particles
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
-      TYPE(section_vals_type), POINTER                   :: print_section
+      TYPE(section_vals_type), POINTER                   :: print_key, print_section
       TYPE(virial_type), POINTER                         :: virial
 
       CALL timeset(routineN, handle)
@@ -97,10 +97,23 @@ CONTAINS
       calc_stress = virial%pv_availability .AND. (.NOT. virial%pv_numer)
       IF (calc_stress .AND. .NOT. calc_forces) CPABORT('Stress cannot be calculated without forces')
 
+      ! Per-committee-member forces are only consumed when the committee
+      ! disagreement is used (bias) or printed; otherwise the all-reduce can
+      ! carry the committee-averaged forces only, an n_committee-fold smaller
+      ! message on the dominant collective.
+      need_per_member = nnp%bias
+      print_section => section_vals_get_subs_vals(nnp%nnp_input, "PRINT")
+      print_key => section_vals_get_subs_vals(print_section, "FORCES")
+      IF (BTEST(cp_print_key_should_output(logger%iter_info, print_key), cp_p_file)) &
+         need_per_member = .TRUE.
+      print_key => section_vals_get_subs_vals(print_section, "FORCES_SIGMA")
+      IF (BTEST(cp_print_key_should_output(logger%iter_info, print_key), cp_p_file)) &
+         need_per_member = .TRUE.
+
       ! Initialize energy and gradient:
       nnp%atomic_energy(:, :) = 0.0_dp
       IF (calc_forces) nnp%myforce(:, :, :) = 0.0_dp
-      IF (calc_forces) nnp%committee_forces(:, :, :) = 0.0_dp
+      IF (calc_forces .AND. need_per_member) nnp%committee_forces(:, :, :) = 0.0_dp
       IF (calc_stress) nnp%committee_stress(:, :, :) = 0.0_dp
 
       !fill coord array
@@ -233,20 +246,36 @@ CONTAINS
       END DO ! loop over num_atoms
 
 
-      ! calculate energy:
-      CALL logger%para_env%sum(nnp%atomic_energy(:, :))
+      ! calculate energy: only the per-committee sums are consumed downstream,
+      ! so reduce n_committee scalars instead of the (num_atoms, n_committee)
+      ! array.  nnp%atomic_energy stays rank-local.
       nnp%committee_energy(:) = SUM(nnp%atomic_energy, 1)
+      CALL logger%para_env%sum(nnp%committee_energy)
       nnp%nnp_potential_energy = SUM(nnp%committee_energy)/REAL(nnp%n_committee, dp)
 
       IF (calc_forces) THEN
-         ! bring myforce to force array
-         DO j = 1, nnp%num_atoms
-            DO k = 1, 3
-               nnp%committee_forces(k, (nnp%sort(j)), :) = nnp%myforce(k, j, :)
+         IF (need_per_member) THEN
+            ! bring myforce to force array
+            DO j = 1, nnp%num_atoms
+               DO k = 1, 3
+                  nnp%committee_forces(k, (nnp%sort(j)), :) = nnp%myforce(k, j, :)
+               END DO
             END DO
-         END DO
-         CALL logger%para_env%sum(nnp%committee_forces)
-         nnp%nnp_forces(:, :) = SUM(nnp%committee_forces, DIM=3)/REAL(nnp%n_committee, dp)
+            CALL logger%para_env%sum(nnp%committee_forces)
+            nnp%nnp_forces(:, :) = SUM(nnp%committee_forces, DIM=3)/REAL(nnp%n_committee, dp)
+         ELSE
+            ! Average over the committee locally and reduce a single (3, N)
+            ! array; committee_forces is left untouched.
+            nnp%nnp_forces(:, :) = 0.0_dp
+            DO i_com = 1, nnp%n_committee
+               DO j = 1, nnp%num_atoms
+                  nnp%nnp_forces(:, nnp%sort(j)) = nnp%nnp_forces(:, nnp%sort(j)) + &
+                                                   nnp%myforce(:, j, i_com)
+               END DO
+            END DO
+            nnp%nnp_forces(:, :) = nnp%nnp_forces(:, :)/REAL(nnp%n_committee, dp)
+            CALL logger%para_env%sum(nnp%nnp_forces)
+         END IF
          DO j = 1, nnp%num_atoms
             particle_set(j)%f(:) = nnp%nnp_forces(:, j)
          END DO
@@ -294,6 +323,7 @@ CONTAINS
 
       INTEGER                                            :: handle, i
       REAL(KIND=dp)                                      :: avrg, pref, sigma
+      REAL(KIND=dp), DIMENSION(nnp%n_committee)          :: ecom
 
       CALL timeset(routineN, handle)
 
@@ -302,18 +332,21 @@ CONTAINS
       nnp%bias_energy = 0.0_dp
       IF (calc_forces) nnp%bias_forces = 0.0_dp
 
-      ! Subtract reference energy of each committee member, if requested
+      ! Subtract reference energy of each committee member, if requested.
+      ! committee_energy itself stays untouched: it is the canonical
+      ! globally-reduced value consumed by the PRINT%ENERGIES output.
       IF (nnp%bias_align) THEN
-         ! committee energy not used afterward, therefore overwritten
-         nnp%committee_energy(:) = nnp%committee_energy(:) - nnp%bias_e_avrg(:)
+         ecom(:) = nnp%committee_energy(:) - nnp%bias_e_avrg(:)
+      ELSE
+         ecom(:) = nnp%committee_energy(:)
       END IF
 
       ! <E> = 1/n sum(E_i)
       ! sigma = sqrt(1/n sum((E_i - <E>)**2))
       !       = sqrt(1/n sum(dE_i**2))
-      avrg = SUM(nnp%committee_energy)/REAL(nnp%n_committee, dp)
+      avrg = SUM(ecom)/REAL(nnp%n_committee, dp)
       DO i = 1, nnp%n_committee
-         sigma = sigma + (nnp%committee_energy(i) - avrg)**2
+         sigma = sigma + (ecom(i) - avrg)**2
       END DO
       sigma = SQRT(sigma/REAL(nnp%n_committee, dp))
       nnp%bias_sigma = sigma
@@ -329,7 +362,7 @@ CONTAINS
             pref = nnp%bias_kb*(1.0_dp - nnp%bias_sigma0/sigma)
             DO i = 1, nnp%n_committee
                nnp%bias_forces(:, :) = nnp%bias_forces(:, :) + &
-                                       (nnp%committee_energy(i) - avrg)* &
+                                       (ecom(i) - avrg)* &
                                        (nnp%committee_forces(:, :, i) - nnp%nnp_forces(:, :))
             END DO
             pref = pref/REAL(nnp%n_committee, dp)
@@ -434,12 +467,14 @@ CONTAINS
          WRITE (unit_nr, "(A)") ""
       END IF
 
+      ! nnp%atomic_energy is rank-local; committee_energy carries the
+      ! globally-reduced per-member sums.
       fmt_string = "(2X,  F20.9)"
       WRITE (UNIT=fmt_string(5:6), FMT="(I2)") nnp%n_committee + 2
-      std = SUM((SUM(nnp%atomic_energy, 1) - nnp%nnp_potential_energy)**2)
+      std = SUM((nnp%committee_energy(:) - nnp%nnp_potential_energy)**2)
       std = std/REAL(nnp%n_committee, dp)
       std = SQRT(std)
-      WRITE (unit_nr, fmt_string) nnp%nnp_potential_energy, std, SUM(nnp%atomic_energy, 1)
+      WRITE (unit_nr, fmt_string) nnp%nnp_potential_energy, std, nnp%committee_energy(:)
 
    END SUBROUTINE nnp_print_energies
 
@@ -629,7 +664,14 @@ CONTAINS
       END IF
 
       WRITE (fmt_string, "(A,I3,A)") "(2X,", nnp%n_committee + 2, "(F20.9,1X))"
-      WRITE (unit_nr, fmt_string) nnp%bias_sigma, nnp%bias_energy, nnp%committee_energy
+      ! committee_energy is no longer overwritten by the bias routine; apply
+      ! the alignment shift here when it is requested.
+      IF (nnp%bias_align) THEN
+         WRITE (unit_nr, fmt_string) nnp%bias_sigma, nnp%bias_energy, &
+            nnp%committee_energy(:) - nnp%bias_e_avrg(:)
+      ELSE
+         WRITE (unit_nr, fmt_string) nnp%bias_sigma, nnp%bias_energy, nnp%committee_energy
+      END IF
 
    END SUBROUTINE nnp_print_bias_energy
 
