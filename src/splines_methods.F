@@ -383,6 +383,7 @@ CONTAINS
 !> \author Claudio Malvino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    PURE FUNCTION clenshaw(c, t) RESULT(val)
+      !DIR$ ATTRIBUTES FORCEINLINE :: clenshaw
       REAL(KIND=dp), DIMENSION(0:), INTENT(IN)           :: c
       REAL(KIND=dp), INTENT(IN)                          :: t
       REAL(KIND=dp)                                      :: val
@@ -413,6 +414,7 @@ CONTAINS
 !> \author Claudio Malvino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    PURE SUBROUTINE clenshaw_d(c, t, val, dvaldt)
+      !DIR$ ATTRIBUTES FORCEINLINE :: clenshaw_d
       REAL(KIND=dp), DIMENSION(0:), INTENT(IN)           :: c
       REAL(KIND=dp), INTENT(IN)                          :: t
       REAL(KIND=dp), INTENT(OUT)                         :: val, dvaldt
@@ -444,6 +446,7 @@ CONTAINS
 !> \author Claudio Malvino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    FUNCTION minimax_cos(xx, y1) RESULT(val)
+      !DIR$ ATTRIBUTES FORCEINLINE :: minimax_cos
       REAL(KIND=dp), INTENT(IN)                          :: xx
       REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: y1
       REAL(KIND=dp)                                      :: val
@@ -468,6 +471,7 @@ CONTAINS
 !> \author Claudio Malvino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    FUNCTION minimax_tanh(xx, y1) RESULT(val)
+      !DIR$ ATTRIBUTES FORCEINLINE :: minimax_tanh
       REAL(KIND=dp), INTENT(IN)                          :: xx
       REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: y1
       REAL(KIND=dp)                                      :: val
@@ -496,6 +500,7 @@ CONTAINS
 !> \author Claudio Malvino (crm98@cam.ac.uk)
 ! **************************************************************************************************
    FUNCTION exp_reduced(xx, y1) RESULT(val)
+      !DIR$ ATTRIBUTES FORCEINLINE :: exp_reduced
       REAL(KIND=dp), INTENT(IN)                          :: xx
       REAL(KIND=dp), INTENT(OUT), OPTIONAL               :: y1
       REAL(KIND=dp)                                      :: val
