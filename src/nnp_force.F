@@ -31,7 +31,8 @@ MODULE nnp_force
                                               dp
    USE nnp_acsf,                        ONLY: nnp_calc_acsf,&
                                               nnp_prepare_cell_list_cache
-   USE nnp_environment_types,           ONLY: nnp_env_get,&
+   USE nnp_environment_types,           ONLY: nnp_arc_type,&
+                                              nnp_env_get,&
                                               nnp_type
    USE nnp_model,                       ONLY: nnp_gradients,&
                                               nnp_predict
@@ -65,13 +66,22 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER :: routineN = 'nnp_calc_energy_force'
 
-      INTEGER                                            :: handle, i, i_com, idx, ie, ig, ind, &
+      INTEGER                                            :: handle, i, i_com, idx, ie, ig, il, ind, &
                                                             istart, j, k, m, max_nsym, mecalc, &
                                                             n_active, n_base, n_remainder
+      LOGICAL                                            :: calc_stress, my_expol, need_per_member
+      ! Per-thread persistent state for the centre-level OMP loop: every
+      ! thread owns its dsymdxyz scratch, active set, network-state clone
+      ! (my_arc: node/node_grad are mutated per centre; the weight copies
+      ! are read-only and cost ~100 kB/thread) and force/stress accumulators
+      ! (my_force/my_cstress, folded into the shared arrays once per call).
       INTEGER, ALLOCATABLE, DIMENSION(:), SAVE                 :: active_atoms, active_flag
-      LOGICAL                                            :: calc_stress, need_per_member
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:), SAVE           :: denergydsym
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), SAVE    :: dsymdxyz, stress
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :, :), SAVE    :: my_force, my_cstress
+      TYPE(nnp_arc_type), ALLOCATABLE, DIMENSION(:), SAVE      :: my_arc
+      !$OMP THREADPRIVATE(active_atoms, active_flag, denergydsym, dsymdxyz, stress, &
+      !$OMP&              my_force, my_cstress, my_arc)
       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
       TYPE(cp_logger_type), POINTER                      :: logger
       TYPE(cp_subsys_type), POINTER                      :: subsys
@@ -165,77 +175,117 @@ CONTAINS
       ! centre atom.
       CALL nnp_prepare_cell_list_cache(nnp)
 
-      ! Persistent per-rank scratch.  dsymdxyz is dimensioned to the largest
-      ! n_nodes(1) across element types so a single buffer serves every centre;
-      ! active_atoms / active_flag carry the set of neighbours that the centre
-      ! actually touched, restricting the force-accumulation loop to that set.
-      IF (calc_forces) THEN
-         max_nsym = 0
+      ! dsymdxyz is dimensioned to the largest n_nodes(1) across element
+      ! types so a single buffer serves every centre.
+      max_nsym = 0
+      DO ie = 1, nnp%n_ele
+         IF (nnp%arc(ie)%n_nodes(1) > max_nsym) max_nsym = nnp%arc(ie)%n_nodes(1)
+      END DO
+
+      ! Centre-level parallelism: whole centres are distributed over the
+      ! team, so nnp_calc_acsf / nnp_predict / nnp_gradients run serially
+      ! within a thread on thread-owned state (no atomics, no critical
+      ! sections in the hot path).  Shared writes from inside the loop are
+      ! nnp%atomic_energy(i, :) only, which is disjoint per centre; force,
+      ! stress, and extrapolation accumulators are per-thread and folded
+      ! once at the end.
+      !$OMP PARALLEL DEFAULT(SHARED) PRIVATE(i, i_com, idx, ie, il, ind, j, k, m, n_active, my_expol)
+
+      my_expol = .FALSE.
+
+      ! Per-thread clone of the network state.  layer is a POINTER component,
+      ! so intrinsic assignment would alias the shared layers; copy depth-2
+      ! explicitly.  Weights are read-only during MD: the clone is built once
+      ! and reused for the rest of the run.
+      IF (.NOT. ALLOCATED(my_arc)) THEN
+         ALLOCATE (my_arc(nnp%n_ele))
          DO ie = 1, nnp%n_ele
-            IF (nnp%arc(ie)%n_nodes(1) > max_nsym) max_nsym = nnp%arc(ie)%n_nodes(1)
+            my_arc(ie)%n_nodes = nnp%arc(ie)%n_nodes
+            ALLOCATE (my_arc(ie)%layer(nnp%n_layer))
+            DO il = 1, nnp%n_layer
+               IF (ALLOCATED(nnp%arc(ie)%layer(il)%weights)) &
+                  my_arc(ie)%layer(il)%weights = nnp%arc(ie)%layer(il)%weights
+               IF (ALLOCATED(nnp%arc(ie)%layer(il)%bweights)) &
+                  my_arc(ie)%layer(il)%bweights = nnp%arc(ie)%layer(il)%bweights
+               IF (ALLOCATED(nnp%arc(ie)%layer(il)%node)) &
+                  my_arc(ie)%layer(il)%node = nnp%arc(ie)%layer(il)%node
+               IF (ALLOCATED(nnp%arc(ie)%layer(il)%node_grad)) &
+                  my_arc(ie)%layer(il)%node_grad = nnp%arc(ie)%layer(il)%node_grad
+            END DO
          END DO
+      END IF
+
+      IF (calc_forces) THEN
          ! Reallocate only on first call or when the system size changes.
-         IF (.NOT. ALLOCATED(dsymdxyz) .OR. SIZE(dsymdxyz, 3) /= nnp%num_atoms) THEN
+         IF (.NOT. ALLOCATED(dsymdxyz) .OR. SIZE(dsymdxyz, 3) /= nnp%num_atoms .OR. &
+             SIZE(dsymdxyz, 1) /= max_nsym) THEN
             IF (ALLOCATED(dsymdxyz)) THEN
                DEALLOCATE (dsymdxyz, active_atoms, active_flag, denergydsym)
                IF (ALLOCATED(stress)) DEALLOCATE (stress)
+               IF (ALLOCATED(my_force)) DEALLOCATE (my_force)
             END IF
             ALLOCATE (dsymdxyz(max_nsym, 3, nnp%num_atoms), SOURCE=0.0_dp)
             ALLOCATE (active_atoms(nnp%num_atoms))
             ALLOCATE (active_flag(nnp%num_atoms), SOURCE=0)
             ALLOCATE (denergydsym(max_nsym))
          END IF
-         IF (calc_stress .AND. .NOT. ALLOCATED(stress)) ALLOCATE (stress(3, 3, max_nsym))
+         IF (.NOT. ALLOCATED(my_force)) &
+            ALLOCATE (my_force(3, nnp%num_atoms, nnp%n_committee))
+         my_force(:, :, :) = 0.0_dp
+         IF (calc_stress) THEN
+            IF (.NOT. ALLOCATED(stress)) ALLOCATE (stress(3, 3, max_nsym))
+            IF (.NOT. ALLOCATED(my_cstress)) ALLOCATE (my_cstress(3, 3, nnp%n_committee))
+            my_cstress(:, :, :) = 0.0_dp
+         END IF
       END IF
 
-      ! calc atomic contribution to energy and force
+      ! calc atomic contribution to energy and force.  Dynamic schedule:
+      ! centres of different elements carry different work (H vs O symmetry
+      ! function counts) and the per-centre cost dwarfs the dispatch.
+      !$OMP DO SCHEDULE(DYNAMIC)
       DO i = istart, istart + mecalc - 1
 
          ! determine index of atom type and offset
          ind = nnp%ele_ind(i)
 
-         ! reset input nodes of ele(ind):
-         nnp%arc(ind)%layer(1)%node(:) = 0.0_dp
-
-         ! compute sym fnct values
+         ! compute sym fnct values; nnp_scale_acsf fully assigns the input
+         ! layer of my_arc(ind), so no reset is needed.
          IF (calc_forces) THEN
-            !reset input grads of ele(ind):
-            nnp%arc(ind)%layer(1)%node_grad(:) = 0.0_dp
             IF (calc_stress) THEN
                stress(:, :, 1:nnp%arc(ind)%n_nodes(1)) = 0.0_dp
                CALL nnp_calc_acsf(nnp, i, dsymdxyz, stress, &
                                   active_atoms=active_atoms, active_flag=active_flag, &
-                                  n_active=n_active)
+                                  n_active=n_active, arc=my_arc(ind), expol=my_expol)
             ELSE
                CALL nnp_calc_acsf(nnp, i, dsymdxyz, &
                                   active_atoms=active_atoms, active_flag=active_flag, &
-                                  n_active=n_active)
+                                  n_active=n_active, arc=my_arc(ind), expol=my_expol)
             END IF
          ELSE
-            CALL nnp_calc_acsf(nnp, i)
+            CALL nnp_calc_acsf(nnp, i, arc=my_arc(ind), expol=my_expol)
          END IF
 
          DO i_com = 1, nnp%n_committee
             ! predict energy
-            CALL nnp_predict(nnp%arc(ind), nnp, i_com)
-            nnp%atomic_energy(i, i_com) = nnp%arc(ind)%layer(nnp%n_layer)%node(1) + &
+            CALL nnp_predict(my_arc(ind), nnp, i_com)
+            nnp%atomic_energy(i, i_com) = my_arc(ind)%layer(nnp%n_layer)%node(1) + &
                                           nnp%atom_energies(ind)
 
             ! predict forces; the inner loop is restricted to the active set
             ! built by nnp_calc_acsf, so the cost is O(n_active) per centre.
             IF (calc_forces) THEN
                ! nnp_gradients fully assigns denergydsym(1:n_nodes(1))
-               CALL nnp_gradients(nnp%arc(ind), nnp, i_com, denergydsym)
+               CALL nnp_gradients(my_arc(ind), nnp, i_com, denergydsym)
                IF (calc_stress) THEN
                   DO j = 1, nnp%arc(ind)%n_nodes(1)
-                     nnp%committee_stress(:, :, i_com) = nnp%committee_stress(:, :, i_com) - &
-                                                         denergydsym(j)*stress(:, :, j)
+                     my_cstress(:, :, i_com) = my_cstress(:, :, i_com) - &
+                                               denergydsym(j)*stress(:, :, j)
                   END DO
                END IF
                DO idx = 1, n_active
                   k = active_atoms(idx)
                   DO m = 1, 3
-                     nnp%myforce(m, k, i_com) = nnp%myforce(m, k, i_com) - &
+                     my_force(m, k, i_com) = my_force(m, k, i_com) - &
                         DOT_PRODUCT(denergydsym(1:nnp%arc(ind)%n_nodes(1)), &
                                     dsymdxyz(1:nnp%arc(ind)%n_nodes(1), m, k))
                   END DO
@@ -254,6 +304,19 @@ CONTAINS
          END IF
 
       END DO ! loop over num_atoms
+      !$OMP END DO
+
+      ! Fold the per-thread accumulators into the shared arrays.  The fold
+      ! is O(3*N*n_committee) adds per thread once per force evaluation;
+      ! thread order is runtime-dependent, so multi-threaded forces are
+      ! bitwise-reproducible only for a fixed thread count.
+      !$OMP CRITICAL (nnp_force_reduce)
+      IF (calc_forces) nnp%myforce(:, :, :) = nnp%myforce(:, :, :) + my_force(:, :, :)
+      IF (calc_stress) nnp%committee_stress(:, :, :) = nnp%committee_stress(:, :, :) + &
+                                                       my_cstress(:, :, :)
+      IF (my_expol) nnp%output_expol = .TRUE.
+      !$OMP END CRITICAL (nnp_force_reduce)
+      !$OMP END PARALLEL
 
 
       ! calculate energy: only the per-committee sums are consumed downstream,

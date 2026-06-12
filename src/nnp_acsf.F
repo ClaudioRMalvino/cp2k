@@ -23,15 +23,13 @@ MODULE nnp_acsf
    USE message_passing,                 ONLY: mp_para_env_type
    USE nnp_environment_types,           ONLY: nnp_acsf_ang_type,&
                                               nnp_acsf_rad_type,&
+                                              nnp_arc_type,&
                                               nnp_cut_cos,&
                                               nnp_cut_tanh,&
                                               nnp_env_get,&
                                               nnp_neighbor_type,&
                                               nnp_type
    USE periodic_table,                  ONLY: get_ptable_info
-   USE splines_methods,                 ONLY: exp_reduced,&
-                                              minimax_cos,&
-                                              minimax_tanh
 #include "./base/base_uses.f90"
 
    IMPLICIT NONE
@@ -95,26 +93,42 @@ MODULE nnp_acsf
 
    TYPE(nnp_cell_list_cache_type), SAVE, PRIVATE :: cell_list_cache
 
-   ! Persistent per-centre neighbour buffer reused across atoms in a force
-   ! evaluation; sized to the largest (n_symfgrp_rad / n_symfgrp_ang) over
-   ! element types so the same buffer serves any centre.
+   ! Persistent per-centre neighbour buffer.  With centre-level OMP threading
+   ! (nnp_calc_energy_force distributes whole centres over the team) every
+   ! thread evaluates complete centres, so each thread owns its own buffer:
+   ! all of the state below is THREADPRIVATE and grown lazily per thread in
+   ! nnp_acsf_ensure_thread_buffers against the req_* sizes published once
+   ! per force evaluation by nnp_neighbor_ensure_persistent (serial).
    TYPE(nnp_neighbor_type), SAVE, PRIVATE, TARGET :: persistent_neighbor
    INTEGER, SAVE, PRIVATE                          :: persistent_n_capacity = -1
    INTEGER, SAVE, PRIVATE                          :: persistent_n_rad_grp = -1
    INTEGER, SAVE, PRIVATE                          :: persistent_n_ang_grp = -1
-   ! Per-thread scratch reused in the hot loops.  scratch_* hold the per-call
-   ! output of nnp_calc_rad / nnp_calc_ang; local_* are per-thread reduction
-   ! accumulators that fold into the shared arrays once per symfgrp under an
-   ! OMP CRITICAL.
+   !$OMP THREADPRIVATE(persistent_neighbor, persistent_n_capacity, &
+   !$OMP&              persistent_n_rad_grp, persistent_n_ang_grp)
+   ! Required buffer sizes, written serially (outside any parallel region)
+   ! once per force evaluation and read by all threads.
+   INTEGER, SAVE, PRIVATE                          :: req_n_capacity = -1
+   INTEGER, SAVE, PRIVATE                          :: req_n_rad_grp = -1
+   INTEGER, SAVE, PRIVATE                          :: req_n_ang_grp = -1
+   INTEGER, SAVE, PRIVATE                          :: req_max_sym = -1
+   INTEGER, SAVE, PRIVATE                          :: req_max_rad = -1
+   INTEGER, SAVE, PRIVATE                          :: req_max_ang = -1
+   INTEGER, DIMENSION(3), SAVE, PRIVATE            :: req_pbc_copies = 0
+   ! Per-thread scratch reused in the hot loops: per-pair outputs of
+   ! nnp_calc_rad / nnp_calc_ang.  Accumulation into dsymdxyz / stress / y
+   ! is direct (each thread owns the whole centre), so no atomics, critical
+   ! sections, or per-group reduction buffers are needed.
    INTEGER, SAVE, PRIVATE                          :: scratch_max_sym = -1
    REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_sym(:)
    REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_forcetmp(:,:)
    REAL(KIND=dp), ALLOCATABLE, SAVE, TARGET, PRIVATE :: scratch_force3tmp(:,:,:)
-   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: local_y(:)
-   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: local_fi(:,:)
-   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: local_stress(:,:,:)
-   !$OMP THREADPRIVATE(scratch_max_sym, scratch_sym, scratch_forcetmp, scratch_force3tmp, &
-   !$OMP&              local_y, local_fi, local_stress)
+   !$OMP THREADPRIVATE(scratch_max_sym, scratch_sym, scratch_forcetmp, scratch_force3tmp)
+   ! Per-thread symmetry-function accumulators for the centre currently being
+   ! evaluated.  These replace the shared nnp%rad(ind)%y / nnp%ang(ind)%y so
+   ! two threads working on centres of the same element cannot collide.
+   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: ws_y_rad(:)
+   REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: ws_y_ang(:)
+   !$OMP THREADPRIVATE(ws_y_rad, ws_y_ang)
    ! Per-neighbour cutoff value/derivative and unit vector, all invariant
    ! over the inner k-loop of nnp_calc_ang.
    INTEGER, SAVE, PRIVATE                          :: scratch_max_fc = -1
@@ -122,19 +136,69 @@ MODULE nnp_acsf
    REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_fc2(:), scratch_dfc2(:)
    REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_dr1dx(:, :)  ! (3, n)
    REAL(KIND=dp), ALLOCATABLE, SAVE, PRIVATE       :: scratch_dr2dx(:, :)  ! (3, n)
+   !$OMP THREADPRIVATE(scratch_max_fc, scratch_fc1, scratch_dfc1, scratch_fc2, scratch_dfc2, &
+   !$OMP&              scratch_dr1dx, scratch_dr2dx)
+
+   ! ------------------------------------------------------------------------------------------------
+   ! Table-free minimax (Remez) polynomial replacements for the EXP/COS/TANH evaluations in the
+   ! ACSF symmetry functions, evaluated by Clenshaw recurrence with compile-time-constant Chebyshev
+   ! coefficients held in registers.  EXP uses range reduction (exp(x) = 2^k * exp(r), r in
+   ! [-ln2/2, ln2/2]) so a degree-9 polynomial gives full RELATIVE precision over the whole
+   ! physical range.  Validated against libm to < 1.4e-13 abs (cos/tanh) / 1.8e-14 rel (exp).
+   ! The kernels live in THIS module (not splines_methods) so they share a translation unit with
+   ! their only call sites: the FORCEINLINE directives are honoured without -ipo/-flto, the call
+   ! overhead disappears, and the enclosing per-neighbour loops can vectorise.
+   ! ------------------------------------------------------------------------------------------------
+   REAL(KIND=dp), PARAMETER, PRIVATE :: ln2     = 0.69314718055994530942_dp
+   REAL(KIND=dp), PARAMETER, PRIVATE :: inv_ln2 = 1.0_dp/0.69314718055994530942_dp
+
+   ! cos on [0, pi]: degree 13 absolute minimax, Chebyshev basis
+   REAL(KIND=dp), PARAMETER, PRIVATE, DIMENSION(0:13) :: c_cos = [ &
+      2.88175278732944771e-15_dp, -1.13364817781174243e+00_dp, 5.57088022257035680e-15_dp, &
+      1.38071776587197798e-01_dp, 5.42073505929545088e-15_dp, -4.49071424654963122e-03_dp, &
+      5.43161196904855680e-15_dp, 6.77012758478224565e-05_dp, 5.75120890083155330e-15_dp, &
+      -5.89129526975551519e-07_dp, 5.82145068847366206e-15_dp, 3.33806418687050215e-09_dp, &
+      2.86158687413815466e-15_dp, -1.32954801664569218e-11_dp]
+
+   ! tanh on [0, 1]: degree 14 absolute minimax, Chebyshev basis
+   REAL(KIND=dp), PARAMETER, PRIVATE, DIMENSION(0:14) :: c_tanh = [ &
+      4.20310759683689694e-01_dp, 3.83970922977466322e-01_dp, -4.06375122829675250e-02_dp, &
+      -3.14432160508101854e-03_dp, 1.14609069487207785e-03_dp, -3.21132819936018998e-05_dp, &
+      -2.25285844615948899e-05_dp, 2.67058666590674381e-06_dp, 2.67416778540631915e-07_dp, &
+      -8.23968257221759303e-08_dp, 1.22045610095099853e-09_dp, 1.72044959173518527e-09_dp, &
+      -1.76286593310703472e-10_dp, -2.28506334347878605e-11_dp, 5.88435334335686724e-12_dp]
+
+   ! exp on reduced range [-ln2/2, ln2/2]: degree 9 relative minimax, Chebyshev basis
+   REAL(KIND=dp), PARAMETER, PRIVATE, DIMENSION(0:9) :: c_exp = [ &
+      1.03025449180961837e+00_dp, 3.51803207837704079e-01_dp, 3.03300103540964511e-02_dp, &
+      1.74756361397688490e-03_dp, 7.55940398271240426e-05_dp, 2.61727190729881307e-06_dp, &
+      7.55358006809067159e-08_dp, 1.86890629967635563e-09_dp, 4.04644375778992957e-11_dp, &
+      7.74402774327636052e-13_dp]
 
 CONTAINS
 
 ! **************************************************************************************************
 !> \brief Calculate atom centered symmetry functions for given atom i
+!>
+!>        Thread-safe at centre level: when arc (and expol) are supplied, all
+!>        mutable state touched by the call is either THREADPRIVATE module
+!>        scratch or caller-owned (dsymdxyz, stress, active set, arc), so
+!>        concurrent calls on different centres are safe.  Without arc/expol
+!>        the shared nnp%arc(ind) / nnp%output_expol are used (serial callers
+!>        such as the helium-NNP coupling keep their old behaviour).
 !> \param nnp ...
 !> \param i ...
 !> \param dsymdxyz ...
 !> \param stress ...
+!> \param arc    (OPTIONAL) network state to fill; pass a per-thread copy when
+!>               calling concurrently
+!> \param expol  (OPTIONAL) extrapolation flag to update instead of
+!>               nnp%output_expol
 !> \date   2020-10-10
 !> \author Christoph Schran (christoph.schran@rub.de)
 ! **************************************************************************************************
-   SUBROUTINE nnp_calc_acsf(nnp, i, dsymdxyz, stress, active_atoms, active_flag, n_active)
+   SUBROUTINE nnp_calc_acsf(nnp, i, dsymdxyz, stress, active_atoms, active_flag, n_active, &
+                            arc, expol)
 
       TYPE(nnp_type), INTENT(INOUT), POINTER             :: nnp
       INTEGER, INTENT(IN)                                :: i
@@ -144,19 +208,22 @@ CONTAINS
          OPTIONAL, TARGET                                :: stress
       INTEGER, DIMENSION(:), OPTIONAL, INTENT(INOUT)     :: active_atoms, active_flag
       INTEGER, OPTIONAL, INTENT(OUT)                     :: n_active
+      TYPE(nnp_arc_type), INTENT(INOUT), OPTIONAL, TARGET :: arc
+      LOGICAL, INTENT(INOUT), OPTIONAL                   :: expol
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'nnp_calc_acsf'
 
       INTEGER                                            :: handle, handle_sf, ind, j, jj, k, kk, l, &
-                                                            m, n_symf_s, off, s, sf, fc_needed, cut_type
-      LOGICAL                                            :: has_stress
+                                                            m, n_symf_s, off, s, sf, cut_type
+      LOGICAL                                            :: has_stress, expol_loc
       REAL(KIND=dp)                                      :: r1, r2, r3, r3sq, r1inv, r2inv, &
-                                                            fc_tmp, dfc_tmp, tanh_v
+                                                            fc_tmp, dfc_tmp, tanh_v, cos_v
       REAL(KIND=dp), DIMENSION(:), POINTER, CONTIGUOUS   :: symtmp
       REAL(KIND=dp), DIMENSION(:, :), POINTER, CONTIGUOUS :: forcetmp
       REAL(KIND=dp), DIMENSION(:, :, :), POINTER, CONTIGUOUS :: force3tmp
       REAL(KIND=dp), DIMENSION(3)                        :: rvect1, rvect2, rvect3
       REAL(KIND=dp), DIMENSION(:, :, :), POINTER         :: stress_p
+      TYPE(nnp_arc_type), POINTER                        :: arc_p
       TYPE(nnp_neighbor_type), POINTER                   :: neighbor
 
       CALL timeset(routineN, handle)
@@ -168,13 +235,26 @@ CONTAINS
       ! field is loop-invariant.
       cut_type = nnp%cut_type
 
-      ! Reuse the module-level neighbour buffer; only the counts are reset
+      ! Grow this thread's persistent buffers to the sizes published by
+      ! nnp_neighbor_ensure_persistent; a handful of integer compares on the
+      ! fast path, allocations only on first use or system-size change.
+      CALL nnp_acsf_ensure_thread_buffers()
+
+      ! Reuse the thread's neighbour buffer; only the counts are reset
       ! between centres, so no allocations occur in the per-atom hot path.
       neighbor => persistent_neighbor
       neighbor%n_rad(:) = 0
       neighbor%n_ang1(:) = 0
       neighbor%n_ang2(:) = 0
       CALL nnp_compute_neighbors(nnp, neighbor, i)
+
+      ! Network state to fill: the caller's per-thread copy if given, the
+      ! shared instance otherwise.
+      IF (PRESENT(arc)) THEN
+         arc_p => arc
+      ELSE
+         arc_p => nnp%arc(ind)
+      END IF
 
       has_stress = PRESENT(stress)
       IF (has_stress) THEN
@@ -223,40 +303,18 @@ CONTAINS
          IF (n_active > 1) CALL nnp_sort_active_atoms(active_atoms, n_active)
       END IF
 
-      ! Reset y:
-      nnp%rad(ind)%y = 0.0_dp
-      nnp%ang(ind)%y = 0.0_dp
+      ! Reset the per-thread symmetry-function accumulators:
+      ws_y_rad(1:nnp%n_rad(ind)) = 0.0_dp
+      ws_y_ang(1:nnp%n_ang(ind)) = 0.0_dp
 
       !calc forces
       IF (PRESENT(dsymdxyz)) THEN
          !loop over radial sym fnct grps
          CALL timeset('nnp_acsf_radial', handle_sf)
-         !$OMP PARALLEL DEFAULT(NONE) &
-         !$OMP&   SHARED(neighbor, nnp, ind, i, dsymdxyz, has_stress, stress_p) &
-         !$OMP&   PRIVATE(j, jj, rvect1, r1, sf, m, l, s, n_symf_s, symtmp, forcetmp)
          DO s = 1, nnp%rad(ind)%n_symfgrp
             n_symf_s = nnp%rad(ind)%symfgrp(s)%n_symf
-            ! Per-thread persistent buffers grow lazily; ALL THREADPRIVATE arrays sized together.
-            IF (.NOT. ALLOCATED(scratch_sym) .OR. .NOT. ALLOCATED(local_y) .OR. &
-                scratch_max_sym < n_symf_s) THEN
-               IF (ALLOCATED(scratch_sym)) DEALLOCATE(scratch_sym)
-               IF (ALLOCATED(scratch_forcetmp)) DEALLOCATE(scratch_forcetmp)
-               IF (ALLOCATED(scratch_force3tmp)) DEALLOCATE(scratch_force3tmp)
-               IF (ALLOCATED(local_y)) DEALLOCATE(local_y)
-               IF (ALLOCATED(local_fi)) DEALLOCATE(local_fi)
-               IF (ALLOCATED(local_stress)) DEALLOCATE(local_stress)
-               ALLOCATE(scratch_sym(n_symf_s), scratch_forcetmp(3, n_symf_s), &
-                        scratch_force3tmp(3, 3, n_symf_s))
-               ALLOCATE(local_y(n_symf_s), local_fi(3, n_symf_s), local_stress(3, 3, n_symf_s))
-               scratch_max_sym = n_symf_s
-            END IF
             symtmp => scratch_sym(1:n_symf_s)
             forcetmp => scratch_forcetmp(:, 1:n_symf_s)
-            ! Reset thread-local accumulators (only the used portion)
-            local_y(1:n_symf_s) = 0.0_dp
-            local_fi(:, 1:n_symf_s) = 0.0_dp
-            IF (has_stress) local_stress(:, :, 1:n_symf_s) = 0.0_dp
-            !$OMP DO SCHEDULE(static)
             DO j = 1, neighbor%n_rad(s)
                rvect1 = neighbor%dist_rad(1:3, j, s)
                r1 = neighbor%dist_rad(4, j, s)
@@ -265,130 +323,62 @@ CONTAINS
                DO sf = 1, n_symf_s
                   m = nnp%rad(ind)%symfgrp(s)%symf(sf)
                   DO l = 1, 3
-                     local_fi(l, sf) = local_fi(l, sf) + forcetmp(l, sf)
-                     !$OMP ATOMIC UPDATE
+                     dsymdxyz(m, l, i) = dsymdxyz(m, l, i) + forcetmp(l, sf)
                      dsymdxyz(m, l, jj) = dsymdxyz(m, l, jj) - forcetmp(l, sf)
                   END DO
                   IF (has_stress) THEN
-                     local_stress(1, 1, sf) = local_stress(1, 1, sf) + rvect1(1)*forcetmp(1, sf)
-                     local_stress(2, 1, sf) = local_stress(2, 1, sf) + rvect1(2)*forcetmp(1, sf)
-                     local_stress(3, 1, sf) = local_stress(3, 1, sf) + rvect1(3)*forcetmp(1, sf)
-                     local_stress(1, 2, sf) = local_stress(1, 2, sf) + rvect1(1)*forcetmp(2, sf)
-                     local_stress(2, 2, sf) = local_stress(2, 2, sf) + rvect1(2)*forcetmp(2, sf)
-                     local_stress(3, 2, sf) = local_stress(3, 2, sf) + rvect1(3)*forcetmp(2, sf)
-                     local_stress(1, 3, sf) = local_stress(1, 3, sf) + rvect1(1)*forcetmp(3, sf)
-                     local_stress(2, 3, sf) = local_stress(2, 3, sf) + rvect1(2)*forcetmp(3, sf)
-                     local_stress(3, 3, sf) = local_stress(3, 3, sf) + rvect1(3)*forcetmp(3, sf)
+                     DO l = 1, 3
+                        stress_p(1, l, m) = stress_p(1, l, m) + rvect1(1)*forcetmp(l, sf)
+                        stress_p(2, l, m) = stress_p(2, l, m) + rvect1(2)*forcetmp(l, sf)
+                        stress_p(3, l, m) = stress_p(3, l, m) + rvect1(3)*forcetmp(l, sf)
+                     END DO
                   END IF
-                  local_y(sf) = local_y(sf) + symtmp(sf)
+                  ws_y_rad(m) = ws_y_rad(m) + symtmp(sf)
                END DO
             END DO
-            !$OMP END DO NOWAIT
-            !$OMP CRITICAL
-            DO sf = 1, n_symf_s
-               m = nnp%rad(ind)%symfgrp(s)%symf(sf)
-               DO l = 1, 3
-                  dsymdxyz(m, l, i) = dsymdxyz(m, l, i) + local_fi(l, sf)
-               END DO
-               IF (has_stress) THEN
-                  DO l = 1, 3
-                     stress_p(1, l, m) = stress_p(1, l, m) + local_stress(1, l, sf)
-                     stress_p(2, l, m) = stress_p(2, l, m) + local_stress(2, l, sf)
-                     stress_p(3, l, m) = stress_p(3, l, m) + local_stress(3, l, sf)
-                  END DO
-               END IF
-               nnp%rad(ind)%y(m) = nnp%rad(ind)%y(m) + local_y(sf)
-            END DO
-            !$OMP END CRITICAL
-            !$OMP BARRIER
          END DO
          NULLIFY(symtmp)
          NULLIFY(forcetmp)
-         !$OMP END PARALLEL
          CALL timestop(handle_sf)
          !loop over angular sym fnct grps
          CALL timeset('nnp_acsf_angular', handle_sf)
          off = nnp%n_rad(ind)
-         !$OMP PARALLEL DEFAULT(NONE) &
-         !$OMP&   SHARED(neighbor, nnp, ind, i, off, dsymdxyz, has_stress, stress_p, &
-         !$OMP&          cut_type, &
-         !$OMP&          scratch_max_fc, scratch_fc1, scratch_dfc1, scratch_fc2, scratch_dfc2, &
-         !$OMP&          scratch_dr1dx, scratch_dr2dx) &
-         !$OMP&   PRIVATE(j, k, jj, kk, rvect1, rvect2, rvect3, r1, r2, r3, r3sq, r1inv, r2inv, &
-         !$OMP&           sf, m, l, s, n_symf_s, fc_tmp, dfc_tmp, tanh_v, fc_needed, &
-         !$OMP&           symtmp, force3tmp)
          DO s = 1, nnp%ang(ind)%n_symfgrp
             n_symf_s = nnp%ang(ind)%symfgrp(s)%n_symf
-            ! Per-thread persistent buffers grow lazily; THREADPRIVATE arrays sized together.
-            IF (.NOT. ALLOCATED(scratch_sym) .OR. .NOT. ALLOCATED(local_y) .OR. &
-                scratch_max_sym < n_symf_s) THEN
-               IF (ALLOCATED(scratch_sym)) DEALLOCATE(scratch_sym)
-               IF (ALLOCATED(scratch_forcetmp)) DEALLOCATE(scratch_forcetmp)
-               IF (ALLOCATED(scratch_force3tmp)) DEALLOCATE(scratch_force3tmp)
-               IF (ALLOCATED(local_y)) DEALLOCATE(local_y)
-               IF (ALLOCATED(local_fi)) DEALLOCATE(local_fi)
-               IF (ALLOCATED(local_stress)) DEALLOCATE(local_stress)
-               ALLOCATE(scratch_sym(n_symf_s), scratch_forcetmp(3, n_symf_s), &
-                        scratch_force3tmp(3, 3, n_symf_s))
-               ALLOCATE(local_y(n_symf_s), local_fi(3, n_symf_s), local_stress(3, 3, n_symf_s))
-               scratch_max_sym = n_symf_s
-            END IF
             symtmp => scratch_sym(1:n_symf_s)
             force3tmp => scratch_force3tmp(:, :, 1:n_symf_s)
-            ! Reset thread-local accumulators
-            local_y(1:n_symf_s) = 0.0_dp
-            local_fi(:, 1:n_symf_s) = 0.0_dp
-            IF (has_stress) local_stress(:, :, 1:n_symf_s) = 0.0_dp
 
             ASSOCIATE (sg => nnp%ang(ind)%symfgrp(s))
             ! Per-j cutoff value, derivative, and unit vector are k-loop
-            ! invariants.  scratch_* is shared across threads, so the realloc
-            ! check runs under OMP SINGLE and the precompute is then split
-            ! across the team with OMP DO.
-            !$OMP SINGLE
-            fc_needed = neighbor%n_ang1(s)
-            IF (sg%ele(1) /= sg%ele(2)) fc_needed = MAX(fc_needed, neighbor%n_ang2(s))
-            IF (scratch_max_fc < fc_needed) THEN
-               IF (ALLOCATED(scratch_fc1)) &
-                  DEALLOCATE(scratch_fc1, scratch_dfc1, scratch_fc2, scratch_dfc2, &
-                             scratch_dr1dx, scratch_dr2dx)
-               ALLOCATE(scratch_fc1(fc_needed), scratch_dfc1(fc_needed))
-               ALLOCATE(scratch_fc2(fc_needed), scratch_dfc2(fc_needed))
-               ALLOCATE(scratch_dr1dx(3, fc_needed), scratch_dr2dx(3, fc_needed))
-               scratch_max_fc = fc_needed
-            END IF
-            !$OMP END SINGLE
-            ! implicit barrier ensures the (re)allocation is visible to every thread
+            ! invariants; precompute once per group.  With the minimax
+            ! kernels inlined (same translation unit) these loops vectorise.
             SELECT CASE (cut_type)
             CASE (nnp_cut_cos)
-               !$OMP DO SCHEDULE(static)
                DO j = 1, neighbor%n_ang1(s)
                   r1 = neighbor%dist_ang1(4, j, s)
                   fc_tmp = r1*sg%pi_over_cut
-                  scratch_fc1(j) = 0.5_dp*(minimax_cos(fc_tmp, y1=dfc_tmp) + 1.0_dp)
+                  CALL minimax_cos_d(fc_tmp, cos_v, dfc_tmp)
+                  scratch_fc1(j) = 0.5_dp*(cos_v + 1.0_dp)
                   scratch_dfc1(j) = 0.5_dp*dfc_tmp*sg%pi_over_cut
                   r1inv = 1.0_dp/r1
                   scratch_dr1dx(1, j) = neighbor%dist_ang1(1, j, s)*r1inv
                   scratch_dr1dx(2, j) = neighbor%dist_ang1(2, j, s)*r1inv
                   scratch_dr1dx(3, j) = neighbor%dist_ang1(3, j, s)*r1inv
                END DO
-               !$OMP END DO
                IF (sg%ele(1) /= sg%ele(2)) THEN
-                  !$OMP DO SCHEDULE(static)
                   DO k = 1, neighbor%n_ang2(s)
                      r2 = neighbor%dist_ang2(4, k, s)
                      fc_tmp = r2*sg%pi_over_cut
-                     scratch_fc2(k) = 0.5_dp*(minimax_cos(fc_tmp, y1=dfc_tmp) + 1.0_dp)
+                     CALL minimax_cos_d(fc_tmp, cos_v, dfc_tmp)
+                     scratch_fc2(k) = 0.5_dp*(cos_v + 1.0_dp)
                      scratch_dfc2(k) = 0.5_dp*dfc_tmp*sg%pi_over_cut
                      r2inv = 1.0_dp/r2
                      scratch_dr2dx(1, k) = neighbor%dist_ang2(1, k, s)*r2inv
                      scratch_dr2dx(2, k) = neighbor%dist_ang2(2, k, s)*r2inv
                      scratch_dr2dx(3, k) = neighbor%dist_ang2(3, k, s)*r2inv
                   END DO
-                  !$OMP END DO
                END IF
             CASE (nnp_cut_tanh)
-               !$OMP DO SCHEDULE(static)
                DO j = 1, neighbor%n_ang1(s)
                   r1 = neighbor%dist_ang1(4, j, s)
                   fc_tmp = 1.0_dp - r1*sg%inv_cut
@@ -400,9 +390,7 @@ CONTAINS
                   scratch_dr1dx(2, j) = neighbor%dist_ang1(2, j, s)*r1inv
                   scratch_dr1dx(3, j) = neighbor%dist_ang1(3, j, s)*r1inv
                END DO
-               !$OMP END DO
                IF (sg%ele(1) /= sg%ele(2)) THEN
-                  !$OMP DO SCHEDULE(static)
                   DO k = 1, neighbor%n_ang2(s)
                      r2 = neighbor%dist_ang2(4, k, s)
                      fc_tmp = 1.0_dp - r2*sg%inv_cut
@@ -414,16 +402,10 @@ CONTAINS
                      scratch_dr2dx(2, k) = neighbor%dist_ang2(2, k, s)*r2inv
                      scratch_dr2dx(3, k) = neighbor%dist_ang2(3, k, s)*r2inv
                   END DO
-                  !$OMP END DO
                END IF
             END SELECT
-            ! implicit barrier at end of last !$OMP DO publishes scratch_fc*/dr* to all threads
 
             IF (sg%ele(1) == sg%ele(2)) THEN
-               ! Triangular k-loop (k = j+1..n_ang1) is not COLLAPSE-able.
-               ! Earlier j carries more work; dynamic scheduling with a small
-               ! chunk handles the imbalance with low overhead.
-               !$OMP DO SCHEDULE(dynamic, 4)
                DO j = 1, neighbor%n_ang1(s)
                   rvect1 = neighbor%dist_ang1(1:3, j, s)
                   r1 = neighbor%dist_ang1(4, j, s)
@@ -444,38 +426,30 @@ CONTAINS
                         DO sf = 1, n_symf_s
                            m = off + sg%symf(sf)
                            DO l = 1, 3
-                              local_fi(l, sf) = local_fi(l, sf) + force3tmp(l, 1, sf)
-                              !$OMP ATOMIC UPDATE
+                              dsymdxyz(m, l, i) = dsymdxyz(m, l, i) + force3tmp(l, 1, sf)
                               dsymdxyz(m, l, jj) = dsymdxyz(m, l, jj) + force3tmp(l, 2, sf)
-                              !$OMP ATOMIC UPDATE
                               dsymdxyz(m, l, kk) = dsymdxyz(m, l, kk) + force3tmp(l, 3, sf)
                            END DO
                            IF (has_stress) THEN
                               DO l = 1, 3
-                                 local_stress(1, l, sf) = local_stress(1, l, sf) &
+                                 stress_p(1, l, m) = stress_p(1, l, m) &
                                     - rvect1(1)*force3tmp(l, 2, sf) - rvect2(1)*force3tmp(l, 3, sf)
-                                 local_stress(2, l, sf) = local_stress(2, l, sf) &
+                                 stress_p(2, l, m) = stress_p(2, l, m) &
                                     - rvect1(2)*force3tmp(l, 2, sf) - rvect2(2)*force3tmp(l, 3, sf)
-                                 local_stress(3, l, sf) = local_stress(3, l, sf) &
+                                 stress_p(3, l, m) = stress_p(3, l, m) &
                                     - rvect1(3)*force3tmp(l, 2, sf) - rvect2(3)*force3tmp(l, 3, sf)
                               END DO
                            END IF
-                           local_y(sf) = local_y(sf) + symtmp(sf)
+                           ws_y_ang(sg%symf(sf)) = ws_y_ang(sg%symf(sf)) + symtmp(sf)
                         END DO
                      END IF
                   END DO
                END DO
-               !$OMP END DO NOWAIT
             ELSE
-               ! Rectangular j-k loop: COLLAPSE(2) flattens the iteration
-               ! space so threads stay busy when n_ang1 alone is too small
-               ! for the team.  The j-only rvect1/r1 reads move inside the
-               ! nested loop to satisfy COLLAPSE's perfect-nesting rule.
-               !$OMP DO COLLAPSE(2) SCHEDULE(dynamic, 16)
                DO j = 1, neighbor%n_ang1(s)
+                  rvect1 = neighbor%dist_ang1(1:3, j, s)
+                  r1 = neighbor%dist_ang1(4, j, s)
                   DO k = 1, neighbor%n_ang2(s)
-                     rvect1 = neighbor%dist_ang1(1:3, j, s)
-                     r1 = neighbor%dist_ang1(4, j, s)
                      rvect2 = neighbor%dist_ang2(1:3, k, s)
                      r2 = neighbor%dist_ang2(4, k, s)
                      rvect3 = rvect2 - rvect1
@@ -492,179 +466,84 @@ CONTAINS
                         DO sf = 1, n_symf_s
                            m = off + sg%symf(sf)
                            DO l = 1, 3
-                              local_fi(l, sf) = local_fi(l, sf) + force3tmp(l, 1, sf)
-                              !$OMP ATOMIC UPDATE
+                              dsymdxyz(m, l, i) = dsymdxyz(m, l, i) + force3tmp(l, 1, sf)
                               dsymdxyz(m, l, jj) = dsymdxyz(m, l, jj) + force3tmp(l, 2, sf)
-                              !$OMP ATOMIC UPDATE
                               dsymdxyz(m, l, kk) = dsymdxyz(m, l, kk) + force3tmp(l, 3, sf)
                            END DO
                            IF (has_stress) THEN
                               DO l = 1, 3
-                                 local_stress(1, l, sf) = local_stress(1, l, sf) &
+                                 stress_p(1, l, m) = stress_p(1, l, m) &
                                     - rvect1(1)*force3tmp(l, 2, sf) - rvect2(1)*force3tmp(l, 3, sf)
-                                 local_stress(2, l, sf) = local_stress(2, l, sf) &
+                                 stress_p(2, l, m) = stress_p(2, l, m) &
                                     - rvect1(2)*force3tmp(l, 2, sf) - rvect2(2)*force3tmp(l, 3, sf)
-                                 local_stress(3, l, sf) = local_stress(3, l, sf) &
+                                 stress_p(3, l, m) = stress_p(3, l, m) &
                                     - rvect1(3)*force3tmp(l, 2, sf) - rvect2(3)*force3tmp(l, 3, sf)
                               END DO
                            END IF
-                           local_y(sf) = local_y(sf) + symtmp(sf)
+                           ws_y_ang(sg%symf(sf)) = ws_y_ang(sg%symf(sf)) + symtmp(sf)
                         END DO
                      END IF
                   END DO
                END DO
-               !$OMP END DO NOWAIT
             END IF
-            !$OMP CRITICAL
-            DO sf = 1, n_symf_s
-               m = off + sg%symf(sf)
-               DO l = 1, 3
-                  dsymdxyz(m, l, i) = dsymdxyz(m, l, i) + local_fi(l, sf)
-               END DO
-               IF (has_stress) THEN
-                  DO l = 1, 3
-                     stress_p(1, l, m) = stress_p(1, l, m) + local_stress(1, l, sf)
-                     stress_p(2, l, m) = stress_p(2, l, m) + local_stress(2, l, sf)
-                     stress_p(3, l, m) = stress_p(3, l, m) + local_stress(3, l, sf)
-                  END DO
-               END IF
-               nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + local_y(sf)
-            END DO
-            !$OMP END CRITICAL
-            !$OMP BARRIER
             END ASSOCIATE
          END DO
          NULLIFY(symtmp)
          NULLIFY(force3tmp)
-         !$OMP END PARALLEL
          CALL timestop(handle_sf)
          !no forces
       ELSE
          !loop over radial sym fnct grps
          CALL timeset('nnp_acsf_radial', handle_sf)
-         !$OMP PARALLEL DEFAULT(NONE) &
-         !$OMP&   SHARED(neighbor, nnp, ind) &
-         !$OMP&   PRIVATE(j, rvect1, r1, sf, m, s, n_symf_s, symtmp)
          DO s = 1, nnp%rad(ind)%n_symfgrp
             n_symf_s = nnp%rad(ind)%symfgrp(s)%n_symf
-            IF (.NOT. ALLOCATED(scratch_sym) .OR. .NOT. ALLOCATED(local_y) .OR. &
-                scratch_max_sym < n_symf_s) THEN
-               IF (ALLOCATED(scratch_sym)) DEALLOCATE(scratch_sym)
-               IF (ALLOCATED(scratch_forcetmp)) DEALLOCATE(scratch_forcetmp)
-               IF (ALLOCATED(scratch_force3tmp)) DEALLOCATE(scratch_force3tmp)
-               IF (ALLOCATED(local_y)) DEALLOCATE(local_y)
-               IF (ALLOCATED(local_fi)) DEALLOCATE(local_fi)
-               IF (ALLOCATED(local_stress)) DEALLOCATE(local_stress)
-               ALLOCATE(scratch_sym(n_symf_s), scratch_forcetmp(3, n_symf_s), &
-                        scratch_force3tmp(3, 3, n_symf_s))
-               ALLOCATE(local_y(n_symf_s), local_fi(3, n_symf_s), local_stress(3, 3, n_symf_s))
-               scratch_max_sym = n_symf_s
-            END IF
             symtmp => scratch_sym(1:n_symf_s)
-            local_y(1:n_symf_s) = 0.0_dp
-            !$OMP DO SCHEDULE(static)
             DO j = 1, neighbor%n_rad(s)
                rvect1 = neighbor%dist_rad(1:3, j, s)
                r1 = neighbor%dist_rad(4, j, s)
                CALL nnp_calc_rad(nnp, ind, s, rvect1, r1, symtmp)
                DO sf = 1, n_symf_s
-                  local_y(sf) = local_y(sf) + symtmp(sf)
+                  m = nnp%rad(ind)%symfgrp(s)%symf(sf)
+                  ws_y_rad(m) = ws_y_rad(m) + symtmp(sf)
                END DO
             END DO
-            !$OMP END DO NOWAIT
-            !$OMP CRITICAL
-            DO sf = 1, n_symf_s
-               m = nnp%rad(ind)%symfgrp(s)%symf(sf)
-               nnp%rad(ind)%y(m) = nnp%rad(ind)%y(m) + local_y(sf)
-            END DO
-            !$OMP END CRITICAL
-            !$OMP BARRIER
          END DO
          NULLIFY(symtmp)
-         !$OMP END PARALLEL
          CALL timestop(handle_sf)
          !loop over angular sym fnct grps
          CALL timeset('nnp_acsf_angular', handle_sf)
          off = nnp%n_rad(ind)
-         !$OMP PARALLEL DEFAULT(NONE) &
-         !$OMP&   SHARED(neighbor, nnp, ind, off, cut_type, &
-         !$OMP&          scratch_max_fc, scratch_fc1, scratch_dfc1, scratch_fc2, scratch_dfc2, &
-         !$OMP&          scratch_dr1dx, scratch_dr2dx) &
-         !$OMP&   PRIVATE(j, k, rvect1, rvect2, rvect3, r1, r2, r3, r3sq, &
-         !$OMP&           sf, m, s, n_symf_s, fc_tmp, fc_needed, symtmp)
          DO s = 1, nnp%ang(ind)%n_symfgrp
             n_symf_s = nnp%ang(ind)%symfgrp(s)%n_symf
-            IF (.NOT. ALLOCATED(scratch_sym) .OR. .NOT. ALLOCATED(local_y) .OR. &
-                scratch_max_sym < n_symf_s) THEN
-               IF (ALLOCATED(scratch_sym)) DEALLOCATE(scratch_sym)
-               IF (ALLOCATED(scratch_forcetmp)) DEALLOCATE(scratch_forcetmp)
-               IF (ALLOCATED(scratch_force3tmp)) DEALLOCATE(scratch_force3tmp)
-               IF (ALLOCATED(local_y)) DEALLOCATE(local_y)
-               IF (ALLOCATED(local_fi)) DEALLOCATE(local_fi)
-               IF (ALLOCATED(local_stress)) DEALLOCATE(local_stress)
-               ALLOCATE(scratch_sym(n_symf_s), scratch_forcetmp(3, n_symf_s), &
-                        scratch_force3tmp(3, 3, n_symf_s))
-               ALLOCATE(local_y(n_symf_s), local_fi(3, n_symf_s), local_stress(3, 3, n_symf_s))
-               scratch_max_sym = n_symf_s
-            END IF
             symtmp => scratch_sym(1:n_symf_s)
-            local_y(1:n_symf_s) = 0.0_dp
 
             ASSOCIATE (sg => nnp%ang(ind)%symfgrp(s))
-            ! Realloc check under SINGLE; the precompute itself is parallelised across the team
-            ! Same realloc-under-SINGLE + parallel precompute pattern as the
-            ! with-forces variant above.
-            !$OMP SINGLE
-            fc_needed = neighbor%n_ang1(s)
-            IF (sg%ele(1) /= sg%ele(2)) &
-               fc_needed = MAX(fc_needed, neighbor%n_ang2(s))
-            IF (scratch_max_fc < fc_needed) THEN
-               IF (ALLOCATED(scratch_fc1)) &
-                  DEALLOCATE(scratch_fc1, scratch_dfc1, scratch_fc2, scratch_dfc2, &
-                             scratch_dr1dx, scratch_dr2dx)
-               ALLOCATE(scratch_fc1(fc_needed), scratch_dfc1(fc_needed))
-               ALLOCATE(scratch_fc2(fc_needed), scratch_dfc2(fc_needed))
-               ALLOCATE(scratch_dr1dx(3, fc_needed), scratch_dr2dx(3, fc_needed))
-               scratch_max_fc = fc_needed
-            END IF
-            !$OMP END SINGLE
-            ! implicit barrier ensures the (re)allocation is visible to every thread
             SELECT CASE (cut_type)
             CASE (nnp_cut_cos)
-               !$OMP DO SCHEDULE(static)
                DO j = 1, neighbor%n_ang1(s)
                   fc_tmp = neighbor%dist_ang1(4, j, s)*sg%pi_over_cut
                   scratch_fc1(j) = 0.5_dp*(minimax_cos(fc_tmp) + 1.0_dp)
                END DO
-               !$OMP END DO
                IF (sg%ele(1) /= sg%ele(2)) THEN
-                  !$OMP DO SCHEDULE(static)
                   DO k = 1, neighbor%n_ang2(s)
                      fc_tmp = neighbor%dist_ang2(4, k, s)*sg%pi_over_cut
                      scratch_fc2(k) = 0.5_dp*(minimax_cos(fc_tmp) + 1.0_dp)
                   END DO
-                  !$OMP END DO
                END IF
             CASE (nnp_cut_tanh)
-               !$OMP DO SCHEDULE(static)
                DO j = 1, neighbor%n_ang1(s)
                   fc_tmp = 1.0_dp - neighbor%dist_ang1(4, j, s)*sg%inv_cut
                   scratch_fc1(j) = minimax_tanh(fc_tmp)**3
                END DO
-               !$OMP END DO
                IF (sg%ele(1) /= sg%ele(2)) THEN
-                  !$OMP DO SCHEDULE(static)
                   DO k = 1, neighbor%n_ang2(s)
                      fc_tmp = 1.0_dp - neighbor%dist_ang2(4, k, s)*sg%inv_cut
                      scratch_fc2(k) = minimax_tanh(fc_tmp)**3
                   END DO
-                  !$OMP END DO
                END IF
             END SELECT
-            ! implicit barrier at end of last !$OMP DO publishes scratch_fc* to all threads
 
             IF (sg%ele(1) == sg%ele(2)) THEN
-               !$OMP DO SCHEDULE(dynamic, 4)
                DO j = 1, neighbor%n_ang1(s)
                   rvect1 = neighbor%dist_ang1(1:3, j, s)
                   r1 = neighbor%dist_ang1(4, j, s)
@@ -678,18 +557,16 @@ CONTAINS
                         CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, r1, r2, r3, symtmp, &
                                           fc1_in=scratch_fc1(j), fc2_in=scratch_fc1(k))
                         DO sf = 1, n_symf_s
-                           local_y(sf) = local_y(sf) + symtmp(sf)
+                           ws_y_ang(sg%symf(sf)) = ws_y_ang(sg%symf(sf)) + symtmp(sf)
                         END DO
                      END IF
                   END DO
                END DO
-               !$OMP END DO NOWAIT
             ELSE
-               !$OMP DO COLLAPSE(2) SCHEDULE(dynamic, 16)
                DO j = 1, neighbor%n_ang1(s)
+                  rvect1 = neighbor%dist_ang1(1:3, j, s)
+                  r1 = neighbor%dist_ang1(4, j, s)
                   DO k = 1, neighbor%n_ang2(s)
-                     rvect1 = neighbor%dist_ang1(1:3, j, s)
-                     r1 = neighbor%dist_ang1(4, j, s)
                      rvect2 = neighbor%dist_ang2(1:3, k, s)
                      r2 = neighbor%dist_ang2(4, k, s)
                      rvect3 = rvect2 - rvect1
@@ -699,46 +576,46 @@ CONTAINS
                         CALL nnp_calc_ang(nnp, ind, s, rvect1, rvect2, rvect3, r1, r2, r3, symtmp, &
                                           fc1_in=scratch_fc1(j), fc2_in=scratch_fc2(k))
                         DO sf = 1, n_symf_s
-                           local_y(sf) = local_y(sf) + symtmp(sf)
+                           ws_y_ang(sg%symf(sf)) = ws_y_ang(sg%symf(sf)) + symtmp(sf)
                         END DO
                      END IF
                   END DO
                END DO
-               !$OMP END DO NOWAIT
             END IF
-            !$OMP CRITICAL
-            DO sf = 1, n_symf_s
-               m = off + sg%symf(sf)
-               nnp%ang(ind)%y(m - off) = nnp%ang(ind)%y(m - off) + local_y(sf)
-            END DO
-            !$OMP END CRITICAL
-            !$OMP BARRIER
             END ASSOCIATE
          END DO
          NULLIFY(symtmp)
-         !$OMP END PARALLEL
          CALL timestop(handle_sf)
       END IF
 
-      !check extrapolation
-      CALL nnp_check_extrapolation(nnp, ind)
+      !check extrapolation; update the caller's flag when given (thread-safe
+      !path), the shared nnp%output_expol otherwise.
+      IF (PRESENT(expol)) THEN
+         CALL nnp_check_extrapolation(nnp, ind, expol)
+      ELSE
+         expol_loc = nnp%output_expol
+         CALL nnp_check_extrapolation(nnp, ind, expol_loc)
+         nnp%output_expol = expol_loc
+      END IF
 
       IF (PRESENT(dsymdxyz)) THEN
          IF (PRESENT(stress)) THEN
             IF (PRESENT(active_atoms) .AND. PRESENT(n_active)) THEN
-               CALL nnp_scale_acsf(nnp, ind, dsymdxyz, stress, active_atoms, n_active)
+               CALL nnp_scale_acsf(nnp, ind, arc_p%layer(1)%node, dsymdxyz, stress, &
+                                   active_atoms, n_active)
             ELSE
-               CALL nnp_scale_acsf(nnp, ind, dsymdxyz, stress)
+               CALL nnp_scale_acsf(nnp, ind, arc_p%layer(1)%node, dsymdxyz, stress)
             END IF
          ELSE
             IF (PRESENT(active_atoms) .AND. PRESENT(n_active)) THEN
-               CALL nnp_scale_acsf(nnp, ind, dsymdxyz, active_atoms=active_atoms, n_active=n_active)
+               CALL nnp_scale_acsf(nnp, ind, arc_p%layer(1)%node, dsymdxyz, &
+                                   active_atoms=active_atoms, n_active=n_active)
             ELSE
-               CALL nnp_scale_acsf(nnp, ind, dsymdxyz)
+               CALL nnp_scale_acsf(nnp, ind, arc_p%layer(1)%node, dsymdxyz)
             END IF
          END IF
       ELSE
-         CALL nnp_scale_acsf(nnp, ind)
+         CALL nnp_scale_acsf(nnp, ind, arc_p%layer(1)%node)
       END IF
 
       ! Module-level buffers are SAVE; no per-call release.
@@ -747,61 +624,69 @@ CONTAINS
    END SUBROUTINE nnp_calc_acsf
 
 ! **************************************************************************************************
-!> \brief Check if the nnp is extrapolating
+!> \brief Check if the nnp is extrapolating (reads the calling thread's
+!>        ws_y_rad / ws_y_ang accumulators)
 !> \param nnp ...
 !> \param ind ...
+!> \param expol  flag to OR the extrapolation status into
 !> \date   2020-10-10
 !> \author Christoph Schran (christoph.schran@rub.de)
 ! **************************************************************************************************
-   SUBROUTINE nnp_check_extrapolation(nnp, ind)
+   SUBROUTINE nnp_check_extrapolation(nnp, ind, expol)
 
-      TYPE(nnp_type), INTENT(INOUT)                      :: nnp
+      TYPE(nnp_type), INTENT(IN)                         :: nnp
       INTEGER, INTENT(IN)                                :: ind
+      LOGICAL, INTENT(INOUT)                             :: expol
 
       REAL(KIND=dp), PARAMETER                           :: threshold = 0.0001_dp
 
       INTEGER                                            :: j
       LOGICAL                                            :: extrapolate
 
-      extrapolate = nnp%output_expol
+      extrapolate = expol
 
       DO j = 1, nnp%n_rad(ind)
-         IF (nnp%rad(ind)%y(j) - &
+         IF (ws_y_rad(j) - &
              nnp%rad(ind)%loc_max(j) > threshold) THEN
             extrapolate = .TRUE.
-         ELSE IF (-nnp%rad(ind)%y(j) + &
+         ELSE IF (-ws_y_rad(j) + &
                   nnp%rad(ind)%loc_min(j) > threshold) THEN
             extrapolate = .TRUE.
          END IF
       END DO
       DO j = 1, nnp%n_ang(ind)
-         IF (nnp%ang(ind)%y(j) - &
+         IF (ws_y_ang(j) - &
              nnp%ang(ind)%loc_max(j) > threshold) THEN
             extrapolate = .TRUE.
-         ELSE IF (-nnp%ang(ind)%y(j) + &
+         ELSE IF (-ws_y_ang(j) + &
                   nnp%ang(ind)%loc_min(j) > threshold) THEN
             extrapolate = .TRUE.
          END IF
       END DO
 
-      nnp%output_expol = extrapolate
+      expol = extrapolate
 
    END SUBROUTINE nnp_check_extrapolation
 
 ! **************************************************************************************************
-!> \brief Scale and center symetry functions (and gradients)
+!> \brief Scale and center symetry functions (and gradients).  Reads the
+!>        calling thread's ws_y_rad / ws_y_ang accumulators and writes the
+!>        caller-supplied input layer.
 !> \param nnp ...
 !> \param ind ...
+!> \param node1  input-layer node vector to fill (layer 1 of the network
+!>               state the caller will evaluate)
 !> \param dsymdxyz ...
 !> \param stress ...
 !> \date   2020-10-10
 !> \author Christoph Schran (christoph.schran@rub.de)
 ! **************************************************************************************************
-   SUBROUTINE nnp_scale_acsf(nnp, ind, dsymdxyz, stress, active_atoms, n_active)
+   SUBROUTINE nnp_scale_acsf(nnp, ind, node1, dsymdxyz, stress, active_atoms, n_active)
 
       TYPE(nnp_type), INTENT(INOUT)                      :: nnp
       INTEGER, INTENT(IN)                                :: ind
-      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(OUT), &
+      REAL(KIND=dp), DIMENSION(:), INTENT(INOUT)         :: node1
+      REAL(KIND=dp), DIMENSION(:, :, :), INTENT(INOUT), &
          OPTIONAL                                        :: dsymdxyz, stress
       INTEGER, DIMENSION(:), OPTIONAL, INTENT(IN)        :: active_atoms
       INTEGER, OPTIONAL, INTENT(IN)                      :: n_active
@@ -813,135 +698,110 @@ CONTAINS
       ! per-symmetry-function divides become multiplies.
       IF (nnp%center_acsf) THEN
          DO j = 1, nnp%n_rad(ind)
-            nnp%arc(ind)%layer(1)%node(j) = &
-               (nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_av(j))
+            node1(j) = (ws_y_rad(j) - nnp%rad(ind)%loc_av(j))
          END DO
          off = nnp%n_rad(ind)
          DO j = 1, nnp%n_ang(ind)
-            nnp%arc(ind)%layer(1)%node(j + off) = &
-               (nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_av(j))
+            node1(j + off) = (ws_y_ang(j) - nnp%ang(ind)%loc_av(j))
          END DO
 
          IF (nnp%scale_acsf) THEN
             DO j = 1, nnp%n_rad(ind)
-               nnp%arc(ind)%layer(1)%node(j) = &
-                  nnp%arc(ind)%layer(1)%node(j)*nnp%rad(ind)%scale_factor(j) + nnp%scmin
+               node1(j) = node1(j)*nnp%rad(ind)%scale_factor(j) + nnp%scmin
             END DO
             off = nnp%n_rad(ind)
             DO j = 1, nnp%n_ang(ind)
-               nnp%arc(ind)%layer(1)%node(j + off) = &
-                  nnp%arc(ind)%layer(1)%node(j + off)*nnp%ang(ind)%scale_factor(j) + nnp%scmin
+               node1(j + off) = node1(j + off)*nnp%ang(ind)%scale_factor(j) + nnp%scmin
             END DO
          END IF
       ELSE IF (nnp%scale_acsf) THEN
          DO j = 1, nnp%n_rad(ind)
-            nnp%arc(ind)%layer(1)%node(j) = &
-               (nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_min(j))*nnp%rad(ind)%scale_factor(j) &
-               + nnp%scmin
+            node1(j) = (ws_y_rad(j) - nnp%rad(ind)%loc_min(j))*nnp%rad(ind)%scale_factor(j) &
+                       + nnp%scmin
          END DO
          off = nnp%n_rad(ind)
          DO j = 1, nnp%n_ang(ind)
-            nnp%arc(ind)%layer(1)%node(j + off) = &
-               (nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_min(j))*nnp%ang(ind)%scale_factor(j) &
-               + nnp%scmin
+            node1(j + off) = (ws_y_ang(j) - nnp%ang(ind)%loc_min(j))*nnp%ang(ind)%scale_factor(j) &
+                             + nnp%scmin
          END DO
       ELSE IF (nnp%scale_sigma_acsf) THEN
          DO j = 1, nnp%n_rad(ind)
-            nnp%arc(ind)%layer(1)%node(j) = &
-               (nnp%rad(ind)%y(j) - nnp%rad(ind)%loc_av(j))*nnp%rad(ind)%inv_sigma_factor(j) &
-               + nnp%scmin
+            node1(j) = (ws_y_rad(j) - nnp%rad(ind)%loc_av(j))*nnp%rad(ind)%inv_sigma_factor(j) &
+                       + nnp%scmin
          END DO
          off = nnp%n_rad(ind)
          DO j = 1, nnp%n_ang(ind)
-            nnp%arc(ind)%layer(1)%node(j + off) = &
-               (nnp%ang(ind)%y(j) - nnp%ang(ind)%loc_av(j))*nnp%ang(ind)%inv_sigma_factor(j) &
-               + nnp%scmin
+            node1(j + off) = (ws_y_ang(j) - nnp%ang(ind)%loc_av(j))*nnp%ang(ind)%inv_sigma_factor(j) &
+                             + nnp%scmin
          END DO
       ELSE
          DO j = 1, nnp%n_rad(ind)
-            nnp%arc(ind)%layer(1)%node(j) = nnp%rad(ind)%y(j)
+            node1(j) = ws_y_rad(j)
          END DO
          off = nnp%n_rad(ind)
          DO j = 1, nnp%n_ang(ind)
-            nnp%arc(ind)%layer(1)%node(j + off) = nnp%ang(ind)%y(j)
+            node1(j + off) = ws_y_ang(j)
          END DO
       END IF
 
-      ! Scale dsymdxyz across the active atoms.  Each (idx, j) pair writes a
-      ! unique dsymdxyz(j, :, k) slot, so no atomics are needed.  COLLAPSE(2)
-      ! flattens (idx, j) so threads stay busy when either dimension is small.
+      ! Scale dsymdxyz across the active atoms (serial: with centre-level
+      ! threading this whole routine runs once per centre per thread).
       IF (PRESENT(dsymdxyz)) THEN
          IF (nnp%scale_acsf) THEN
             IF (PRESENT(active_atoms) .AND. PRESENT(n_active)) THEN
-               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(idx, j, k) SCHEDULE(static)
                DO idx = 1, n_active
+                  k = active_atoms(idx)
                   DO j = 1, nnp%n_rad(ind)
-                     k = active_atoms(idx)
                      dsymdxyz(j, :, k) = dsymdxyz(j, :, k)*nnp%rad(ind)%scale_factor(j)
                   END DO
                END DO
-               !$OMP END PARALLEL DO
                off = nnp%n_rad(ind)
-               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(idx, j, k) SCHEDULE(static)
                DO idx = 1, n_active
+                  k = active_atoms(idx)
                   DO j = 1, nnp%n_ang(ind)
-                     k = active_atoms(idx)
                      dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)*nnp%ang(ind)%scale_factor(j)
                   END DO
                END DO
-               !$OMP END PARALLEL DO
             ELSE
-               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(k, j) SCHEDULE(static)
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_rad(ind)
                      dsymdxyz(j, :, k) = dsymdxyz(j, :, k)*nnp%rad(ind)%scale_factor(j)
                   END DO
                END DO
-               !$OMP END PARALLEL DO
                off = nnp%n_rad(ind)
-               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(k, j) SCHEDULE(static)
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_ang(ind)
                      dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)*nnp%ang(ind)%scale_factor(j)
                   END DO
                END DO
-               !$OMP END PARALLEL DO
             END IF
          ELSE IF (nnp%scale_sigma_acsf) THEN
             IF (PRESENT(active_atoms) .AND. PRESENT(n_active)) THEN
-               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(idx, j, k) SCHEDULE(static)
                DO idx = 1, n_active
+                  k = active_atoms(idx)
                   DO j = 1, nnp%n_rad(ind)
-                     k = active_atoms(idx)
                      dsymdxyz(j, :, k) = dsymdxyz(j, :, k)*nnp%rad(ind)%inv_sigma_factor(j)
                   END DO
                END DO
-               !$OMP END PARALLEL DO
                off = nnp%n_rad(ind)
-               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(idx, j, k) SCHEDULE(static)
                DO idx = 1, n_active
+                  k = active_atoms(idx)
                   DO j = 1, nnp%n_ang(ind)
-                     k = active_atoms(idx)
                      dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)*nnp%ang(ind)%inv_sigma_factor(j)
                   END DO
                END DO
-               !$OMP END PARALLEL DO
             ELSE
-               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(k, j) SCHEDULE(static)
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_rad(ind)
                      dsymdxyz(j, :, k) = dsymdxyz(j, :, k)*nnp%rad(ind)%inv_sigma_factor(j)
                   END DO
                END DO
-               !$OMP END PARALLEL DO
                off = nnp%n_rad(ind)
-               !$OMP PARALLEL DO COLLAPSE(2) DEFAULT(SHARED) PRIVATE(k, j) SCHEDULE(static)
                DO k = 1, nnp%num_atoms
                   DO j = 1, nnp%n_ang(ind)
                      dsymdxyz(j + off, :, k) = dsymdxyz(j + off, :, k)*nnp%ang(ind)%inv_sigma_factor(j)
                   END DO
                END DO
-               !$OMP END PARALLEL DO
             END IF
          END IF
       END IF
@@ -993,7 +853,7 @@ CONTAINS
 
       INTEGER                                            :: k, sf, cut_type
       REAL(KIND=dp)                                      :: dfcutdr, dsymdr, eta, fcut, funccut, rs, &
-                                                            tmp, dcos_dx, tanh_val, rinv
+                                                            tmp, cos_val, dcos_dx, tanh_val, rinv
       REAL(KIND=dp), DIMENSION(3)                        :: drdx
 
       !init
@@ -1011,7 +871,8 @@ CONTAINS
       CASE (nnp_cut_cos)
          tmp = r * sg%pi_over_cut
          IF (PRESENT(force)) THEN
-            fcut = 0.5_dp*(minimax_cos(tmp, y1=dcos_dx) + 1.0_dp)
+            CALL minimax_cos_d(tmp, cos_val, dcos_dx)
+            fcut = 0.5_dp*(cos_val + 1.0_dp)
             dfcutdr = 0.5_dp*dcos_dx*(pi/funccut)
          ELSE
             fcut = 0.5_dp*(minimax_cos(tmp) + 1.0_dp)
@@ -1102,6 +963,7 @@ CONTAINS
       REAL(KIND=dp) :: angular, costheta, dfcutdr1, dfcutdr2, dfcutdr3, dsymdr1, dsymdr2, dsymdr3, &
          eta, f, fcut, fcut1, fcut2, fcut3, ftot, g, g_sq_inv, lam, pref, prefzeta, rsqr1, rsqr2, &
          rsqr3, r_sum_sq, r1inv, r2inv, r3inv, symtmp, tmp, tmp1, tmp2, tmp3, tmpzeta, zeta
+      REAL(KIND=dp) :: cos_val1, cos_val2, cos_val3
       REAL(KIND=dp) :: dcos_dx1, dcos_dx2, dcos_dx3
       REAL(KIND=dp) :: tanh_val1, tanh_val2, tanh_val3
       REAL(KIND=dp) :: pz2, pz4, pz8
@@ -1137,14 +999,17 @@ CONTAINS
       CASE (nnp_cut_cos)
          tmp3 = r3 * sg%pi_over_cut
          IF (PRESENT(force)) THEN
-            fcut3 = 0.5_dp*(minimax_cos(tmp3, y1=dcos_dx3) + 1.0_dp)
+            CALL minimax_cos_d(tmp3, cos_val3, dcos_dx3)
+            fcut3 = 0.5_dp*(cos_val3 + 1.0_dp)
             IF (PRESENT(fc1_in)) THEN
                fcut1 = fc1_in;  fcut2 = fc2_in
             ELSE
                tmp1 = r1 * sg%pi_over_cut
                tmp2 = r2 * sg%pi_over_cut
-               fcut1 = 0.5_dp*(minimax_cos(tmp1, y1=dcos_dx1) + 1.0_dp)
-               fcut2 = 0.5_dp*(minimax_cos(tmp2, y1=dcos_dx2) + 1.0_dp)
+               CALL minimax_cos_d(tmp1, cos_val1, dcos_dx1)
+               CALL minimax_cos_d(tmp2, cos_val2, dcos_dx2)
+               fcut1 = 0.5_dp*(cos_val1 + 1.0_dp)
+               fcut2 = 0.5_dp*(cos_val2 + 1.0_dp)
             END IF
          ELSE
             fcut3 = 0.5_dp*(minimax_cos(tmp3) + 1.0_dp)
@@ -2415,12 +2280,15 @@ CONTAINS
    END SUBROUTINE nnp_compute_pbc_copies
 
 ! **************************************************************************************************
-!> \brief Size the module-level persistent neighbour buffer to the maximum
-!>        capacity needed across element types.
+!> \brief Publish the buffer sizes every thread needs for the current system
+!>        (neighbour capacity, group counts, largest symmetry-function group,
+!>        y-accumulator lengths, pbc copies).
 !>
-!>        After the first call (and after every num_atoms / cutoff change)
-!>        the per-centre nnp_compute_neighbors invocation just resets counts
-!>        and fills the existing buffer.
+!>        Runs serially once per force evaluation (from
+!>        nnp_prepare_cell_list_cache).  The per-thread allocations happen in
+!>        nnp_acsf_ensure_thread_buffers, called by each thread at the top of
+!>        nnp_calc_acsf, because THREADPRIVATE storage can only be touched by
+!>        its owning thread.
 !> \param nnp ...
 !> \param n_capacity  per-group row capacity; the caller derives it from the
 !>                    cell-list walk bound (bins visited x longest chain)
@@ -2435,7 +2303,6 @@ CONTAINS
 
       INTEGER                                            :: handle, ie, n_ang_grp, &
                                  n_rad_grp, max_sym, s
-      INTEGER, DIMENSION(3)                              :: pbc_copies
       TYPE(cell_type), POINTER                           :: cell
 
       CALL timeset(routineN, handle)
@@ -2443,7 +2310,7 @@ CONTAINS
       NULLIFY (cell)
       CALL nnp_env_get(nnp_env=nnp, cell=cell)
 
-      CALL nnp_compute_pbc_copies(pbc_copies, cell, nnp%max_cut)
+      CALL nnp_compute_pbc_copies(req_pbc_copies, cell, nnp%max_cut)
 
       n_rad_grp = 0
       n_ang_grp = 0
@@ -2452,7 +2319,7 @@ CONTAINS
          IF (nnp%ang(ie)%n_symfgrp > n_ang_grp) n_ang_grp = nnp%ang(ie)%n_symfgrp
       END DO
 
-      ! Size the scratch buffers to the largest symmetry-function group.
+      ! Largest symmetry-function group over all element types.
       max_sym = 0
       DO ie = 1, nnp%n_ele
          DO s = 1, nnp%rad(ie)%n_symfgrp
@@ -2463,62 +2330,224 @@ CONTAINS
          END DO
       END DO
       IF (max_sym < 1) max_sym = 1
-      ! Threadprivate arrays: this only sizes the master thread's copy.  Non-master threads
-      ! allocate their own copies lazily on first entry to the parallel region (the same
-      ! grow-to-fit check is performed there).
-      IF (.NOT. ALLOCATED(scratch_sym) .OR. .NOT. ALLOCATED(local_y) .OR. &
-          scratch_max_sym < max_sym) THEN
-         IF (ALLOCATED(scratch_sym)) DEALLOCATE(scratch_sym)
-         IF (ALLOCATED(scratch_forcetmp)) DEALLOCATE(scratch_forcetmp)
-         IF (ALLOCATED(scratch_force3tmp)) DEALLOCATE(scratch_force3tmp)
-         IF (ALLOCATED(local_y)) DEALLOCATE(local_y)
-         IF (ALLOCATED(local_fi)) DEALLOCATE(local_fi)
-         IF (ALLOCATED(local_stress)) DEALLOCATE(local_stress)
-         ALLOCATE(scratch_sym(max_sym))
-         ALLOCATE(scratch_forcetmp(3, max_sym))
-         ALLOCATE(scratch_force3tmp(3,3,max_sym))
-         ALLOCATE(local_y(max_sym), local_fi(3, max_sym), local_stress(3, 3, max_sym))
-         scratch_max_sym = max_sym
-      END IF
 
-      ! Fast path: buffer already at-or-above required shape.
-      IF (ALLOCATED(persistent_neighbor%dist_rad) .AND. &
-          persistent_n_capacity >= n_capacity .AND. &
-          persistent_n_rad_grp >= n_rad_grp .AND. &
-          persistent_n_ang_grp >= n_ang_grp) THEN
-         persistent_neighbor%pbc_copies = pbc_copies
-         CALL timestop(handle)
-         RETURN
-      END IF
-
-      ! Reallocate to the max capacity across element types.
-      IF (ALLOCATED(persistent_neighbor%dist_rad)) DEALLOCATE (persistent_neighbor%dist_rad)
-      IF (ALLOCATED(persistent_neighbor%dist_ang1)) DEALLOCATE (persistent_neighbor%dist_ang1)
-      IF (ALLOCATED(persistent_neighbor%dist_ang2)) DEALLOCATE (persistent_neighbor%dist_ang2)
-      IF (ALLOCATED(persistent_neighbor%ind_rad)) DEALLOCATE (persistent_neighbor%ind_rad)
-      IF (ALLOCATED(persistent_neighbor%ind_ang1)) DEALLOCATE (persistent_neighbor%ind_ang1)
-      IF (ALLOCATED(persistent_neighbor%ind_ang2)) DEALLOCATE (persistent_neighbor%ind_ang2)
-      IF (ALLOCATED(persistent_neighbor%n_rad)) DEALLOCATE (persistent_neighbor%n_rad)
-      IF (ALLOCATED(persistent_neighbor%n_ang1)) DEALLOCATE (persistent_neighbor%n_ang1)
-      IF (ALLOCATED(persistent_neighbor%n_ang2)) DEALLOCATE (persistent_neighbor%n_ang2)
-
-      ALLOCATE (persistent_neighbor%dist_rad(4, n_capacity, n_rad_grp))
-      ALLOCATE (persistent_neighbor%dist_ang1(4, n_capacity, n_ang_grp))
-      ALLOCATE (persistent_neighbor%dist_ang2(4, n_capacity, n_ang_grp))
-      ALLOCATE (persistent_neighbor%ind_rad(n_capacity, n_rad_grp))
-      ALLOCATE (persistent_neighbor%ind_ang1(n_capacity, n_ang_grp))
-      ALLOCATE (persistent_neighbor%ind_ang2(n_capacity, n_ang_grp))
-      ALLOCATE (persistent_neighbor%n_rad(n_rad_grp))
-      ALLOCATE (persistent_neighbor%n_ang1(n_ang_grp))
-      ALLOCATE (persistent_neighbor%n_ang2(n_ang_grp))
-
-      persistent_neighbor%pbc_copies = pbc_copies
-      persistent_n_capacity = n_capacity
-      persistent_n_rad_grp = n_rad_grp
-      persistent_n_ang_grp = n_ang_grp
+      req_n_capacity = MAX(1, n_capacity)
+      req_n_rad_grp = MAX(1, n_rad_grp)
+      req_n_ang_grp = MAX(1, n_ang_grp)
+      req_max_sym = max_sym
+      req_max_rad = MAX(1, MAXVAL(nnp%n_rad))
+      req_max_ang = MAX(1, MAXVAL(nnp%n_ang))
 
       CALL timestop(handle)
 
    END SUBROUTINE nnp_neighbor_ensure_persistent
+
+! **************************************************************************************************
+!> \brief Grow the calling thread's persistent buffers (neighbour lists,
+!>        per-pair scratch, fc precompute arrays, y accumulators) to the
+!>        req_* sizes published by nnp_neighbor_ensure_persistent.
+!>
+!>        Fast path is a handful of integer compares; allocations happen on
+!>        a thread's first centre and after system-size changes only.
+!> \date   2026-06-12
+!> \author Claudio Malvino (crm98@cam.ac.uk)
+! **************************************************************************************************
+   SUBROUTINE nnp_acsf_ensure_thread_buffers()
+
+      IF (req_n_capacity < 1 .OR. req_max_sym < 1) &
+         CPABORT("NNP| nnp_neighbor_ensure_persistent must run before nnp_calc_acsf")
+
+      IF (scratch_max_sym < req_max_sym) THEN
+         IF (ALLOCATED(scratch_sym)) &
+            DEALLOCATE (scratch_sym, scratch_forcetmp, scratch_force3tmp)
+         ALLOCATE (scratch_sym(req_max_sym))
+         ALLOCATE (scratch_forcetmp(3, req_max_sym))
+         ALLOCATE (scratch_force3tmp(3, 3, req_max_sym))
+         scratch_max_sym = req_max_sym
+      END IF
+
+      IF (.NOT. ALLOCATED(ws_y_rad)) THEN
+         ALLOCATE (ws_y_rad(req_max_rad), ws_y_ang(req_max_ang))
+      ELSE IF (SIZE(ws_y_rad) < req_max_rad .OR. SIZE(ws_y_ang) < req_max_ang) THEN
+         DEALLOCATE (ws_y_rad, ws_y_ang)
+         ALLOCATE (ws_y_rad(req_max_rad), ws_y_ang(req_max_ang))
+      END IF
+
+      ! fc precompute arrays hold one entry per ang1/ang2 neighbour, which is
+      ! bounded by the per-group neighbour capacity.
+      IF (scratch_max_fc < req_n_capacity) THEN
+         IF (ALLOCATED(scratch_fc1)) &
+            DEALLOCATE (scratch_fc1, scratch_dfc1, scratch_fc2, scratch_dfc2, &
+                        scratch_dr1dx, scratch_dr2dx)
+         ALLOCATE (scratch_fc1(req_n_capacity), scratch_dfc1(req_n_capacity))
+         ALLOCATE (scratch_fc2(req_n_capacity), scratch_dfc2(req_n_capacity))
+         ALLOCATE (scratch_dr1dx(3, req_n_capacity), scratch_dr2dx(3, req_n_capacity))
+         scratch_max_fc = req_n_capacity
+      END IF
+
+      IF (persistent_n_capacity < req_n_capacity .OR. &
+          persistent_n_rad_grp < req_n_rad_grp .OR. &
+          persistent_n_ang_grp < req_n_ang_grp) THEN
+         IF (ALLOCATED(persistent_neighbor%dist_rad)) THEN
+            DEALLOCATE (persistent_neighbor%dist_rad, persistent_neighbor%dist_ang1, &
+                        persistent_neighbor%dist_ang2, persistent_neighbor%ind_rad, &
+                        persistent_neighbor%ind_ang1, persistent_neighbor%ind_ang2, &
+                        persistent_neighbor%n_rad, persistent_neighbor%n_ang1, &
+                        persistent_neighbor%n_ang2)
+         END IF
+         ALLOCATE (persistent_neighbor%dist_rad(4, req_n_capacity, req_n_rad_grp))
+         ALLOCATE (persistent_neighbor%dist_ang1(4, req_n_capacity, req_n_ang_grp))
+         ALLOCATE (persistent_neighbor%dist_ang2(4, req_n_capacity, req_n_ang_grp))
+         ALLOCATE (persistent_neighbor%ind_rad(req_n_capacity, req_n_rad_grp))
+         ALLOCATE (persistent_neighbor%ind_ang1(req_n_capacity, req_n_ang_grp))
+         ALLOCATE (persistent_neighbor%ind_ang2(req_n_capacity, req_n_ang_grp))
+         ALLOCATE (persistent_neighbor%n_rad(req_n_rad_grp))
+         ALLOCATE (persistent_neighbor%n_ang1(req_n_ang_grp))
+         ALLOCATE (persistent_neighbor%n_ang2(req_n_ang_grp))
+         persistent_n_capacity = req_n_capacity
+         persistent_n_rad_grp = req_n_rad_grp
+         persistent_n_ang_grp = req_n_ang_grp
+      END IF
+
+      persistent_neighbor%pbc_copies = req_pbc_copies
+
+   END SUBROUTINE nnp_acsf_ensure_thread_buffers
+
+! **************************************************************************************************
+!> \brief Evaluate a Chebyshev series sum_k c(k) T_k(t), t in [-1,1], by Clenshaw recurrence.
+!>        Value only (fast path for energy-only evaluations).
+!> \param c   Chebyshev coefficients, indexed 0:n
+!> \param t   evaluation point mapped to [-1, 1]
+!> \return    series value at t
+!> \author Claudio Malvino (crm98@cam.ac.uk)
+! **************************************************************************************************
+   PURE FUNCTION clenshaw(c, t) RESULT(val)
+      !DIR$ ATTRIBUTES FORCEINLINE :: clenshaw
+      REAL(KIND=dp), DIMENSION(0:), INTENT(IN)           :: c
+      REAL(KIND=dp), INTENT(IN)                          :: t
+      REAL(KIND=dp)                                      :: val
+
+      INTEGER                                            :: j
+      REAL(KIND=dp)                                      :: b0, b1, b2, t2
+
+      t2 = 2.0_dp*t
+      b1 = 0.0_dp
+      b2 = 0.0_dp
+      DO j = UBOUND(c, 1), 1, -1
+         b0 = t2*b1 - b2 + c(j)
+         b2 = b1
+         b1 = b0
+      END DO
+      val = t*b1 - b2 + c(0)
+   END FUNCTION clenshaw
+
+! **************************************************************************************************
+!> \brief As clenshaw, but also returns the derivative dval/dt of the series.  Carrying the
+!>        derivative through the same recurrence guarantees the returned slope is the exact
+!>        analytic derivative of the returned value, so energies and forces stay consistent.
+!> \param c       Chebyshev coefficients, indexed 0:n
+!> \param t       evaluation point mapped to [-1, 1]
+!> \param val     series value at t
+!> \param dvaldt  derivative of the series w.r.t. t at t
+!> \author Claudio Malvino (crm98@cam.ac.uk)
+! **************************************************************************************************
+   PURE SUBROUTINE clenshaw_d(c, t, val, dvaldt)
+      !DIR$ ATTRIBUTES FORCEINLINE :: clenshaw_d
+      REAL(KIND=dp), DIMENSION(0:), INTENT(IN)           :: c
+      REAL(KIND=dp), INTENT(IN)                          :: t
+      REAL(KIND=dp), INTENT(OUT)                         :: val, dvaldt
+
+      INTEGER                                            :: j
+      REAL(KIND=dp)                                      :: b0, b1, b2, db0, db1, db2, t2
+
+      t2 = 2.0_dp*t
+      b1 = 0.0_dp; b2 = 0.0_dp
+      db1 = 0.0_dp; db2 = 0.0_dp
+      DO j = UBOUND(c, 1), 1, -1
+         b0  = t2*b1 - b2 + c(j)
+         db0 = 2.0_dp*b1 + t2*db1 - db2
+         b2 = b1; b1 = b0
+         db2 = db1; db1 = db0
+      END DO
+      val    = t*b1 - b2 + c(0)
+      dvaldt = b1 + t*db1 - db2
+   END SUBROUTINE clenshaw_d
+
+! **************************************************************************************************
+!> \brief Table-free approximation of cos(xx) for xx in [0, pi] via a degree-13 minimax
+!>        polynomial; value only.
+!> \param xx   argument in [0, pi]
+!> \return     approximation of cos(xx)
+!> \author Claudio Malvino (crm98@cam.ac.uk)
+! **************************************************************************************************
+   PURE FUNCTION minimax_cos(xx) RESULT(val)
+      !DIR$ ATTRIBUTES FORCEINLINE :: minimax_cos
+      REAL(KIND=dp), INTENT(IN)                          :: xx
+      REAL(KIND=dp)                                      :: val
+
+      ! map [0, pi] -> [-1, 1]
+      val = clenshaw(c_cos, (2.0_dp/pi)*xx - 1.0_dp)
+   END FUNCTION minimax_cos
+
+! **************************************************************************************************
+!> \brief As minimax_cos, returning value and first derivative.  A separate entry point (instead
+!>        of an OPTIONAL derivative argument) keeps both variants branch-free and inlinable.
+!> \param xx   argument in [0, pi]
+!> \param val  approximation of cos(xx)
+!> \param y1   first derivative d/dxx at xx (approximately -sin(xx))
+!> \author Claudio Malvino (crm98@cam.ac.uk)
+! **************************************************************************************************
+   PURE SUBROUTINE minimax_cos_d(xx, val, y1)
+      !DIR$ ATTRIBUTES FORCEINLINE :: minimax_cos_d
+      REAL(KIND=dp), INTENT(IN)                          :: xx
+      REAL(KIND=dp), INTENT(OUT)                         :: val, y1
+
+      REAL(KIND=dp)                                      :: dvaldt
+
+      ! map [0, pi] -> [-1, 1]
+      CALL clenshaw_d(c_cos, (2.0_dp/pi)*xx - 1.0_dp, val, dvaldt)
+      y1 = dvaldt*(2.0_dp/pi)
+   END SUBROUTINE minimax_cos_d
+
+! **************************************************************************************************
+!> \brief Table-free approximation of tanh(xx) for xx in [0, 1] via a degree-14 minimax
+!>        polynomial; value only (the cutoff derivative reuses the value algebraically).
+!> \param xx   argument in [0, 1]
+!> \return     approximation of tanh(xx)
+!> \author Claudio Malvino (crm98@cam.ac.uk)
+! **************************************************************************************************
+   PURE FUNCTION minimax_tanh(xx) RESULT(val)
+      !DIR$ ATTRIBUTES FORCEINLINE :: minimax_tanh
+      REAL(KIND=dp), INTENT(IN)                          :: xx
+      REAL(KIND=dp)                                      :: val
+
+      ! map [0, 1] -> [-1, 1]
+      val = clenshaw(c_tanh, 2.0_dp*xx - 1.0_dp)
+   END FUNCTION minimax_tanh
+
+! **************************************************************************************************
+!> \brief Table-free approximation of exp(xx) via range reduction exp(x) = 2^k * exp(r),
+!>        r = x - k*ln2 in [-ln2/2, ln2/2], with exp(r) from a degree-9 minimax polynomial that is
+!>        accurate to full RELATIVE precision.  2^k is applied exactly with the SCALE intrinsic,
+!>        so the tail decays correctly (e.g. exp(-50) is right to all digits).  d/dx exp = exp, so
+!>        callers reuse the value in the chain rule; no derivative entry point is needed.
+!> \param xx   argument (any real; physical ACSF inputs are <= 0)
+!> \return     approximation of exp(xx)
+!> \author Claudio Malvino (crm98@cam.ac.uk)
+! **************************************************************************************************
+   PURE FUNCTION exp_reduced(xx) RESULT(val)
+      !DIR$ ATTRIBUTES FORCEINLINE :: exp_reduced
+      REAL(KIND=dp), INTENT(IN)                          :: xx
+      REAL(KIND=dp)                                      :: val
+
+      INTEGER                                            :: k
+      REAL(KIND=dp)                                      :: r, t
+
+      k = NINT(xx*inv_ln2)
+      r = xx - REAL(k, KIND=dp)*ln2
+      ! map r in [-ln2/2, ln2/2] -> [-1, 1]
+      t = r*(2.0_dp*inv_ln2)
+      val = SCALE(clenshaw(c_exp, t), k)
+   END FUNCTION exp_reduced
 
 END MODULE nnp_acsf
