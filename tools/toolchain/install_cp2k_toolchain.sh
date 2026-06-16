@@ -275,6 +275,8 @@ Specific options of --with-PKG:
                           Default = install
   --with-ace              Enable interface to ML-pace library.
                           Default = no
+  --with-mace             Enable interface to the MACE/symmetrix library.
+                          Default = no
   --with-deepmd           Enable interface to DeePMD-kit library.
                           This does not include other DeepModeling utilities
                           like DP-GEN or dpdata.
@@ -458,7 +460,7 @@ mpi_list="mpich openmpi intelmpi"
 math_list="mkl acml openblas"
 lib_list="fftw libint libxc libxsmm cosma scalapack elpa dbcsr
           cusolvermp plumed spfft spla gsl spglib hdf5 libvdwxc sirius
-          libvori libtorch deepmd ace dftd4 tblite pugixml libsmeagol
+          libvori libtorch deepmd ace mace dftd4 tblite pugixml libsmeagol
           trexio greenx gmp mcl"
 package_list="${tool_list} ${mpi_list} ${math_list} ${lib_list}"
 # ------------------------------------------------------------------------
@@ -846,6 +848,9 @@ Otherwise use option no."
       ;;
     --with-ace*)
       with_ace=$(read_with "${1}")
+      ;;
+    --with-mace*)
+      with_mace=$(read_with "${1}")
       ;;
     --with-plumed*)
       with_plumed=$(read_with "${1}")

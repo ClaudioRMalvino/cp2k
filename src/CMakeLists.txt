@@ -351,6 +351,7 @@ list(
   manybody_siepmann.F
   manybody_tersoff.F
   manybody_ace.F
+  mace_api.F
   mao_basis.F
   mao_methods.F
   mao_optimizer.F
@@ -1482,7 +1483,7 @@ list(APPEND CP2K_SRCS_F grpp/libgrpp.F)
 
 set(CP2K_FPGA_SRC_C pw/fpga/fft_fpga.c pw/fpga/opencl_utils.c)
 set(CP2K_PW_SRCS_C pw/gpu/pw_gpu_internal.c)
-set(CP2K_SRCS_CPP torch_c_api.cpp ace_c_api.cpp)
+set(CP2K_SRCS_CPP torch_c_api.cpp ace_c_api.cpp mace_c_api.cpp)
 
 list(APPEND CP2K_SRCS_C "${CP2K_OFFLOAD_SRCS_C}" "${CP2K_MPIWRAP_SRCS_C}")
 
@@ -1519,6 +1520,7 @@ set(CP2K_PROGS_F
     motion/dumpdcd.F
     motion/xyz2dcd.F
     nequip_unittest.F
+    mace_unittest.F
     gx_ac_unittest.F)
 
 if(CP2K_USE_CUDA
@@ -1736,6 +1738,7 @@ target_link_libraries(
     DeePMD::deepmd_c>
     $<$<BOOL:${CP2K_USE_PEXSI}>:PEXSI::PEXSI>
     $<$<BOOL:${CP2K_USE_ACE}>:cp2k::ACE>
+    $<$<BOOL:${CP2K_USE_MACE}>:cp2k::symmetrix>
     $<$<BOOL:${CP2K_USE_TBLITE}>:cp2k::tblite>
     $<$<BOOL:${CP2K_USE_SIRIUS}>:sirius::sirius>
     $<$<BOOL:${CP2K_USE_VORI}>:cp2k::VORI::vori>
@@ -1809,6 +1812,7 @@ target_compile_definitions(
     $<$<OR:$<BOOL:${CP2K_USE_FFTW3_}>,$<BOOL:${CP2K_USE_FFTW3_MKL_}>>:__FFTW3>
     $<$<BOOL:${CP2K_USE_LIBINT2}>:__LIBINT>
     $<$<BOOL:${CP2K_USE_LIBTORCH}>:__LIBTORCH>
+    $<$<BOOL:${CP2K_USE_MACE}>:__MACE>
     $<$<BOOL:${CP2K_USE_COSMA}>:__COSMA>
     $<$<BOOL:${CP2K_USE_LIBXSMM}>:__LIBXSMM>
     $<$<BOOL:${CCP2K_USE_SIRIUS_DFTD4}>:__SIRIUS_DFTD4>
@@ -1856,6 +1860,7 @@ list(
   "xyz2dcd"
   "libcp2k_unittest"
   "nequip_unittest"
+  "mace_unittest"
   "dbt_unittest"
   "dbt_tas_unittest"
   "gx_ac_unittest")
@@ -1871,6 +1876,7 @@ add_executable(dumpdcd motion/dumpdcd.F)
 add_executable(xyz2dcd motion/xyz2dcd.F)
 add_executable(libcp2k_unittest start/libcp2k_unittest.c)
 add_executable(nequip_unittest nequip_unittest.F)
+add_executable(mace_unittest mace_unittest.F)
 add_executable(dbt_unittest dbt/dbt_unittest.F)
 add_executable(dbt_tas_unittest dbt/tas/dbt_tas_unittest.F)
 add_executable(gx_ac_unittest gx_ac_unittest.F)

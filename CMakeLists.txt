@@ -131,6 +131,8 @@ option(CP2K_USE_GREENX "Enable GreenX support" ${CP2K_USE_EVERYTHING})
 option(CP2K_USE_HDF5 "Enable HDF5 support" ${CP2K_USE_EVERYTHING})
 option(CP2K_USE_LIBINT2 "Enable Libint2 support" ${CP2K_USE_EVERYTHING})
 option(CP2K_USE_LIBTORCH "Enable LibTorch support" ${CP2K_USE_EVERYTHING})
+option(CP2K_USE_MACE "Enable MACE support via the symmetrix library"
+       ${CP2K_USE_EVERYTHING})
 option(CP2K_USE_OPENPMD "Enable support for I/O via openPMD" OFF)
 option(CP2K_USE_LIBXC "Enable LibXC support" ${CP2K_USE_EVERYTHING})
 option(CP2K_USE_MPI "Enable MPI support" ${CP2K_USE_EVERYTHING})
@@ -812,6 +814,20 @@ if(CP2K_USE_ACE)
                       INTERFACE_LINK_LIBRARIES)
 endif()
 
+if(CP2K_USE_MACE)
+  find_package(Symmetrix REQUIRED)
+  get_target_property(CP2K_SYMMETRIX_INCLUDE_DIRS cp2k::symmetrix
+                      INTERFACE_INCLUDE_DIRECTORIES)
+  get_target_property(CP2K_SYMMETRIX_LINK_LIBRARIES cp2k::symmetrix
+                      INTERFACE_LINK_LIBRARIES)
+  # The symmetrix headers use std::span and require C++20; raise the project
+  # C++ standard if it is currently lower (same approach as LibTorch above).
+  if(CMAKE_CXX_STANDARD LESS 20)
+    set(CMAKE_CXX_STANDARD 20)
+    message("-- MACE: raising CMAKE_CXX_STANDARD to ${CMAKE_CXX_STANDARD}")
+  endif()
+endif()
+
 if(CP2K_USE_TBLITE)
   find_package(mctc-lib REQUIRED)
   find_package(toml-f REQUIRED)
@@ -1073,6 +1089,12 @@ if(CP2K_USE_DEEPMD)
   message(" - DeePMD\n\n")
 endif()
 
+if(CP2K_USE_MACE)
+  message(" - MACE (symmetrix)\n"
+          "   - include directories: ${CP2K_SYMMETRIX_INCLUDE_DIRS}\n"
+          "   - libraries          : ${CP2K_SYMMETRIX_LINK_LIBRARIES}\n\n")
+endif()
+
 if(CP2K_USE_PEXSI)
   message(" - PEXSI\n" # keep line break
           "   - include directories: ${CP2K_PEXSI_INCLUDE_DIRS}\n"
@@ -1170,6 +1192,10 @@ endif()
 
 if(NOT CP2K_USE_ACE)
   message("   - ACE (libpace)")
+endif()
+
+if(NOT CP2K_USE_MACE)
+  message("   - MACE (symmetrix)")
 endif()
 
 if(NOT CP2K_USE_TBLITE)

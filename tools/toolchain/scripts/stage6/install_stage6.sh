@@ -8,5 +8,6 @@
 ./scripts/stage6/install_libtorch.sh
 ./scripts/stage6/install_deepmd.sh
 ./scripts/stage6/install_ace.sh
+./scripts/stage6/install_mace.sh
 
 #EOF
